@@ -1,0 +1,57 @@
+id = "hermes"
+name = "Hermes Agent (remoto)"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Abre la TUI de una instancia remota de Hermes Agent en un panel de herdr"
+platforms = ["linux", "macos"]
+
+# Panel principal: se engancha al PTY persistente del dashboard. Cerrar el panel
+# no mata la sesión de Hermes; al reabrirlo se reengancha al mismo PTY.
+[[panes]]
+id = "chat"
+title = "Hermes"
+placement = "split"
+description = "Adjuntar a la sesión persistente de Hermes"
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/hermes-term"']
+
+# Igual que el anterior pero descartando la sesión guardada (PTY nuevo).
+[[panes]]
+id = "chat-fresh"
+title = "Hermes (nueva sesión)"
+placement = "split"
+description = "Arrancar una sesión de Hermes limpia"
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/hermes-term" --fresh']
+
+# Descarta el PTY persistente y arranca otro, también persistente. A diferencia
+# del anterior, el panel sobrevive al cierre; se usa cuando el PTY guardado se
+# queda atascado, porque desde el cliente no se puede matar uno vivo.
+[[panes]]
+id = "chat-reset"
+title = "Hermes"
+placement = "split"
+description = "Reiniciar el PTY persistente de Hermes"
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/hermes-term" --reset']
+
+# Abre el panel `chat`. Existe como acción porque los keybindings solo saben
+# invocar acciones (type = "plugin_action"), no paneles directamente.
+[[actions]]
+id = "open-chat"
+title = "Hermes: abrir panel"
+contexts = ["global"]
+command = ["sh", "-c", 'exec "$HERDR_BIN_PATH" plugin pane open --plugin hermes --entrypoint chat --direction right']
+
+# Descarta el PTY persistente y abre el panel sobre uno nuevo, también
+# persistente. Es la salida cuando la sesión de un panel se queda atascada: no
+# hay forma de matar un PTY vivo desde el cliente, solo de dejar de usarlo.
+[[actions]]
+id = "reset"
+title = "Hermes: reiniciar sesión"
+contexts = ["global"]
+command = ["sh", "-c", 'exec "$HERDR_BIN_PATH" plugin pane open --plugin hermes --entrypoint chat-reset --direction right']
+
+# Diagnóstico: login + ticket + handshake, sin entrar en modo raw.
+[[actions]]
+id = "check"
+title = "Hermes: comprobar conexión"
+contexts = ["global"]
+command = ["sh", "-c", '"$HERDR_PLUGIN_ROOT/bin/hermes-term" --check']

@@ -1,0 +1,703 @@
+#!/usr/bin/env python3
+"""hermes-term — conecta un panel de herdr con la TUI de una instancia remota de Hermes Agent.
+
+Flujo (todo contra el dashboard, puerto 9119 por defecto):
+
+  1. POST /auth/password-login  {provider, username, password}  -> cookies de sesión
+  2. POST /api/auth/ws-ticket                                   -> ticket de un solo uso (TTL 30 s)
+  3. WS   /api/pty?ticket=…&attach=…&channel=…                  -> PTY con la TUI de Hermes
+
+El websocket es binario en ambos sentidos: lo que llega se escribe tal cual en el
+terminal y lo que se teclea se manda tal cual. El único mensaje con formato es el
+redimensionado, que el servidor consume sin pasarlo al PTY:
+
+    ESC [ RESIZE:<cols>;<rows> ]
+
+`attach` mantiene el PTY vivo aunque se cierre el panel: al reabrirlo se reengancha
+a la misma sesión en vez de arrancar Hermes de cero.
+
+Cuando el servidor tiene que arrancar un PTY nuevo decide qué sesión reanudar
+leyendo un fichero temporal propio de cada `channel`, donde la TUI apunta su sesión
+actual. Ese rastro no se valida: si la sesión que nombra ya no está en la base de
+datos —el caso típico es abrir el panel, no escribir nada y cerrarlo, porque una
+sesión vacía nunca llega a persistirse— la TUI arranca con
+`error: session not found` y sin historial. Como el rastro solo se reescribe al
+crear o reanudar una sesión, el error se queda pegado en todas las aperturas
+siguientes.
+
+Por eso el puente no deja que el servidor recurra a ese rastro a ciegas: se guarda
+él mismo la última sesión conocida de cada workspace y la valida contra
+`GET /api/sessions/<id>` antes de conectar. Si sigue viva, conecta igual que
+siempre y deja que el servidor la reanude; si ha desaparecido, manda `fresh=1`,
+que borra el rastro podrido en el servidor y arranca en limpio en vez de enseñar
+el error.
+
+Sin dependencias: solo biblioteca estándar (el cliente websocket va aquí abajo).
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import errno
+import fcntl
+import hashlib
+import http.cookiejar
+import json
+import os
+import re
+import select
+import signal
+import socket
+import ssl
+import struct
+import sys
+import termios
+import tty
+import urllib.error
+import urllib.parse
+import urllib.request
+
+PLUGIN_ID = "hermes"
+GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"  # RFC 6455
+
+# herdr identifica al agente de un panel mirando el argv[0] del proceso en
+# primer plano y lo compara con los manifiestos de ~/.local/state/herdr/
+# agent-detection. Como aquí el proceso es este puente en Python, el panel
+# saldría solo en «spaces» y nunca en «agents»; por eso nos reexec con
+# argv[0] = "hermes". A partir de ahí herdr aplica el manifiesto de hermes y
+# saca idle/working/blocked de lo que pinta la TUI remota, sin que tengamos que
+# reportar estados a mano.
+AGENT_ARGV0 = "hermes"
+REEXEC_FLAG = "HERMES_TERM_REEXEC"
+
+# Motivos de cierre que el servidor manda en /api/pty; los traducimos para que el
+# panel diga qué ha pasado en vez de cerrarse en silencio.
+CLOSE_REASONS = {
+    4401: "credencial rechazada (ticket caducado o inválido)",
+    4403: "Host/Origin no coincide con el bind del dashboard",
+    4404: "el chat embebido está desactivado en el servidor",
+    4408: "este cliente no está permitido por el servidor",
+    4410: "el proceso de Hermes ha terminado",
+}
+
+
+# --------------------------------------------------------------------------- #
+# Configuración
+# --------------------------------------------------------------------------- #
+
+def config_dirs() -> list[str]:
+    """Directorios donde buscar el .env, del más específico al legado."""
+    dirs = []
+    injected = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+    if injected:
+        dirs.append(injected)
+    home = os.path.expanduser("~/.config/herdr/plugins")
+    dirs.append(os.path.join(home, "config", PLUGIN_ID))
+    dirs.append(os.path.join(home, PLUGIN_ID))  # ubicación antigua
+    return dirs
+
+
+def load_env() -> dict[str, str]:
+    """Lee el primer .env que exista. El entorno real tiene prioridad."""
+    values: dict[str, str] = {}
+    for directory in config_dirs():
+        path = os.path.join(directory, ".env")
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, raw = line.partition("=")
+                values[key.strip()] = raw.strip().strip("'\"")
+        break
+    for key in ("HERMES_URL", "HERMES_USER", "HERMES_PASSWORD", "HERMES_PROVIDER"):
+        if os.environ.get(key):
+            values[key] = os.environ[key]
+    return values
+
+
+def workspace_slug() -> str:
+    """Nombre del workspace de herdr, saneado para usarlo en ficheros y tokens."""
+    workspace = os.environ.get("HERDR_WORKSPACE_ID") or "default"
+    return re.sub(r"[^A-Za-z0-9._-]", "-", workspace)
+
+
+def attach_token() -> str:
+    """Identificador estable del PTY: uno por workspace de herdr.
+
+    Un panel reabierto en el mismo workspace vuelve a la misma sesión de Hermes;
+    workspaces distintos obtienen PTYs distintos. La generación (ver --reset) va
+    en el token porque es lo único que el cliente puede cambiar para que el
+    servidor arranque un PTY nuevo: no hay forma de matar uno vivo desde aquí.
+    """
+    generation = read_generation()
+    suffix = f"-g{generation}" if generation else ""
+    return f"herdr-{workspace_slug()}{suffix}"
+
+
+# --------------------------------------------------------------------------- #
+# Estado local: última sesión conocida de cada workspace
+# --------------------------------------------------------------------------- #
+#
+# Solo sirve para responder a una pregunta antes de conectar: ¿la sesión que el
+# servidor intentaría reanudar sigue existiendo? Perder este fichero no rompe
+# nada — como mucho se arranca una sesión limpia de más.
+
+def state_dir() -> str:
+    injected = os.environ.get("HERDR_PLUGIN_STATE_DIR")
+    if injected:
+        return injected
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "herdr", "plugins", PLUGIN_ID)
+
+
+def state_path() -> str:
+    return os.path.join(state_dir(), f"session-{workspace_slug()}.json")
+
+
+def read_state() -> dict:
+    try:
+        with open(state_path(), encoding="utf-8") as handle:
+            saved = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return saved if isinstance(saved, dict) else {}
+
+
+def write_state(session_id: str, generation: int) -> None:
+    """Vuelca el estado del workspace. Best-effort: si falla, no pasa nada."""
+    path = state_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump({"session_id": session_id, "generation": generation}, handle)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def read_known_session() -> str:
+    """Id de la última sesión que vimos en este workspace, o "" si no hay."""
+    return str(read_state().get("session_id") or "")
+
+
+def read_generation() -> int:
+    try:
+        return max(0, int(read_state().get("generation") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def write_known_session(session_id: str) -> None:
+    """Anota (o borra, con cadena vacía) la sesión, sin tocar la generación."""
+    write_state(session_id, read_generation())
+
+
+def bump_generation() -> str:
+    """Cambia el token del PTY para que el servidor tenga que arrancar uno nuevo.
+
+    El PTY anterior se queda huérfano y el servidor lo recoge cuando caduca por
+    inactividad; el token nuevo se guarda, así que las aperturas siguientes se
+    reenganchan a este y el panel sigue siendo persistente.
+    """
+    write_state("", read_generation() + 1)
+    return attach_token()
+
+
+# --------------------------------------------------------------------------- #
+# HTTP: login + ticket
+# --------------------------------------------------------------------------- #
+
+class HermesAuthError(RuntimeError):
+    pass
+
+
+class HermesClient:
+    def __init__(self, base_url: str, user: str, password: str, provider: str = "basic"):
+        self.base = base_url.rstrip("/")
+        self.user = user
+        self.password = password
+        self.provider = provider
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar)
+        )
+
+    def _post(self, path: str, payload: dict | None) -> dict:
+        data = json.dumps(payload).encode("utf-8") if payload is not None else b""
+        request = urllib.request.Request(
+            self.base + path,
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        try:
+            with self.opener.open(request, timeout=15) as response:
+                body = response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:200]
+            raise HermesAuthError(f"{path} -> HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise HermesAuthError(f"{path} -> {exc.reason}") from exc
+        return json.loads(body) if body else {}
+
+    def login(self) -> None:
+        self._post(
+            "/auth/password-login",
+            {
+                "provider": self.provider,
+                "username": self.user,
+                "password": self.password,
+            },
+        )
+
+    def ws_ticket(self) -> str:
+        """Ticket de un solo uso con 30 s de vida: se pide justo antes de conectar."""
+        ticket = self._post("/api/auth/ws-ticket", None).get("ticket")
+        if not ticket:
+            raise HermesAuthError("el servidor no ha devuelto ticket")
+        return ticket
+
+    def _get(self, path: str) -> tuple[int, dict]:
+        """GET que devuelve (código, cuerpo). El 404 es una respuesta, no un error."""
+        request = urllib.request.Request(
+            self.base + path, method="GET", headers={"Accept": "application/json"}
+        )
+        try:
+            with self.opener.open(request, timeout=15) as response:
+                body = response.read()
+                return response.status, (json.loads(body) if body else {})
+        except urllib.error.HTTPError as exc:
+            exc.read()
+            return exc.code, {}
+        except urllib.error.URLError as exc:
+            raise HermesAuthError(f"{path} -> {exc.reason}") from exc
+
+    def session_exists(self, session_id: str) -> bool:
+        """¿Sigue en la base de datos? El servidor contesta 404 si ya no está."""
+        if not session_id:
+            return False
+        code, _ = self._get("/api/sessions/" + urllib.parse.quote(session_id))
+        return code == 200
+
+    def newest_tui_session(self) -> str:
+        """Id de la sesión de TUI más reciente, o "" si no hay ninguna.
+
+        `/api/sessions` viene ordenado por fecha de inicio descendente, así que
+        basta con el primer registro cuyo origen sea la TUI. Las sesiones vacías
+        no se persisten, de modo que aquí solo aparecen las que tienen contenido
+        real — justo las que merece la pena reanudar.
+        """
+        _, body = self._get("/api/sessions?limit=100")
+        for session in body.get("sessions") or []:
+            if session.get("source") == "tui" and session.get("id"):
+                return str(session["id"])
+        return ""
+
+
+# --------------------------------------------------------------------------- #
+# Cliente websocket mínimo (RFC 6455, solo lo que necesita /api/pty)
+# --------------------------------------------------------------------------- #
+
+class WSClosed(Exception):
+    def __init__(self, code: int, reason: str):
+        super().__init__(f"{code} {reason}".strip())
+        self.code = code
+        self.reason = reason
+
+
+class WebSocket:
+    def __init__(self, sock: socket.socket, leftover: bytes = b""):
+        self.sock = sock
+        self.buffer = bytearray(leftover)
+
+    @classmethod
+    def connect(cls, url: str, timeout: float = 15.0) -> "WebSocket":
+        parts = urllib.parse.urlsplit(url)
+        secure = parts.scheme == "wss"
+        port = parts.port or (443 if secure else 80)
+        host = parts.hostname or ""
+        sock = socket.create_connection((host, port), timeout=timeout)
+        if secure:
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+
+        key = base64.b64encode(os.urandom(16))
+        target = parts.path + (f"?{parts.query}" if parts.query else "")
+        # Sin cabecera Origin a propósito: el servidor acepta su ausencia y así no
+        # hay que fingir un origen de navegador. El Host sí debe coincidir con el
+        # bind del dashboard (guarda anti DNS-rebinding).
+        handshake = (
+            f"GET {target} HTTP/1.1\r\n"
+            f"Host: {parts.netloc}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key.decode()}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        ).encode("ascii")
+        sock.sendall(handshake)
+
+        raw = bytearray()
+        while b"\r\n\r\n" not in raw:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("el servidor cerró durante el handshake")
+            raw += chunk
+        head, _, rest = bytes(raw).partition(b"\r\n\r\n")
+        status = head.split(b"\r\n", 1)[0].decode("latin-1")
+        if " 101 " not in status:
+            raise ConnectionError(f"handshake rechazado: {status}")
+
+        expected = base64.b64encode(hashlib.sha1(key + GUID).digest()).decode()
+        headers = {}
+        for line in head.decode("latin-1").split("\r\n")[1:]:
+            name, _, value = line.partition(":")
+            headers[name.strip().lower()] = value.strip()
+        if headers.get("sec-websocket-accept") != expected:
+            raise ConnectionError("Sec-WebSocket-Accept inválido")
+
+        sock.settimeout(None)
+        return cls(sock, rest)
+
+    # -- lectura -----------------------------------------------------------
+    def _read(self, count: int) -> bytes:
+        while len(self.buffer) < count:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise WSClosed(1006, "conexión cerrada por el otro extremo")
+            self.buffer += chunk
+        out = bytes(self.buffer[:count])
+        del self.buffer[:count]
+        return out
+
+    def recv(self) -> bytes:
+        """Devuelve la carga útil del siguiente mensaje de datos (texto o binario).
+
+        Los frames de control (ping/pong/close) se resuelven aquí mismo.
+        """
+        payload = bytearray()
+        while True:
+            first, second = self._read(2)
+            fin = bool(first & 0x80)
+            opcode = first & 0x0F
+            masked = bool(second & 0x80)
+            length = second & 0x7F
+            if length == 126:
+                (length,) = struct.unpack("!H", self._read(2))
+            elif length == 127:
+                (length,) = struct.unpack("!Q", self._read(8))
+            mask = self._read(4) if masked else b""
+            data = self._read(length) if length else b""
+            if masked:
+                data = bytes(byte ^ mask[i % 4] for i, byte in enumerate(data))
+
+            if opcode == 0x8:  # close
+                code = struct.unpack("!H", data[:2])[0] if len(data) >= 2 else 1005
+                raise WSClosed(code, data[2:].decode("utf-8", "replace"))
+            if opcode == 0x9:  # ping -> pong
+                self.send(data, opcode=0xA)
+                continue
+            if opcode == 0xA:  # pong
+                continue
+
+            payload += data
+            if fin:
+                return bytes(payload)
+
+    # -- escritura ---------------------------------------------------------
+    def send(self, data: bytes, opcode: int = 0x2) -> None:
+        header = bytearray([0x80 | opcode])
+        length = len(data)
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < (1 << 16):
+            header.append(0x80 | 126)
+            header += struct.pack("!H", length)
+        else:
+            header.append(0x80 | 127)
+            header += struct.pack("!Q", length)
+        mask = os.urandom(4)
+        header += mask
+        masked = bytes(byte ^ mask[i % 4] for i, byte in enumerate(data))
+        self.sock.sendall(bytes(header) + masked)
+
+    def close(self) -> None:
+        try:
+            self.send(struct.pack("!H", 1000), opcode=0x8)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# Puente terminal <-> websocket
+# --------------------------------------------------------------------------- #
+
+def terminal_size() -> tuple[int, int]:
+    try:
+        size = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8)
+        rows, cols = struct.unpack("hhhh", size)[:2]
+        if rows and cols:
+            return cols, rows
+    except (OSError, ValueError):
+        pass
+    return 80, 24
+
+
+def send_resize(ws: WebSocket) -> None:
+    cols, rows = terminal_size()
+    ws.send(f"\x1b[RESIZE:{cols};{rows}]".encode("ascii"))
+
+
+def notice(text: str) -> None:
+    """Mensaje propio del puente, en amarillo y con CR porque el tty está en raw."""
+    sys.stdout.write(f"\r\n\x1b[33m{text}\x1b[0m\r\n")
+    sys.stdout.flush()
+
+
+def bridge(ws: WebSocket) -> int:
+    """Bombea stdin -> websocket -> stdout hasta que uno de los dos se cierre."""
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+    saved = termios.tcgetattr(stdin_fd)
+
+    # El manejador de SIGWINCH solo escribe en la tubería; el trabajo real se
+    # hace en el bucle para no reentrar en el socket desde una señal.
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_w, False)
+    signal.set_wakeup_fd(wake_w)
+    signal.signal(signal.SIGWINCH, lambda *_: None)
+
+    try:
+        tty.setraw(stdin_fd)
+        send_resize(ws)
+        while True:
+            try:
+                ready, _, _ = select.select([stdin_fd, ws.sock, wake_r], [], [])
+            except InterruptedError:
+                continue
+
+            if wake_r in ready:
+                try:
+                    os.read(wake_r, 4096)
+                except BlockingIOError:
+                    pass
+                send_resize(ws)
+
+            if stdin_fd in ready:
+                try:
+                    data = os.read(stdin_fd, 65536)
+                except OSError as exc:
+                    if exc.errno != errno.EIO:
+                        raise
+                    data = b""
+                if not data:
+                    return 0
+                ws.send(data)
+
+            if ws.sock in ready:
+                data = ws.recv()
+                if data:
+                    os.write(stdout_fd, data)
+    except WSClosed as closed:
+        detail = CLOSE_REASONS.get(closed.code, closed.reason or "sin motivo")
+        if closed.code == 4410:
+            notice("Hermes ha terminado la sesión.")
+            return 0
+        notice(f"Conexión cerrada ({closed.code}): {detail}")
+        return 1 if closed.code != 1000 else 0
+    finally:
+        signal.set_wakeup_fd(-1)
+        os.close(wake_r)
+        os.close(wake_w)
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, saved)
+
+
+# --------------------------------------------------------------------------- #
+
+def build_ws_url(base: str, ticket: str, fresh: bool, keepalive: bool = True) -> str:
+    """URL del PTY. `fresh` arranca sin reanudar; `keepalive` sobrevive al panel.
+
+    Son independientes a propósito. `fresh` solo afecta al arranque de un PTY
+    nuevo y no toca la clave del registro, así que un panel persistente puede
+    pedir arranque limpio sin perder el reenganche: si el PTY sigue vivo se
+    reengancha (y entonces no hay nada que reanudar), y si no, arranca limpio.
+    Mandar `resume` sí cambiaría esa clave y dejaría dos Hermes sobre la misma
+    sesión, por eso no se usa.
+
+    Sin `keepalive` el servidor usa la ruta 1:1 y mata el PTY al desconectar, que
+    es justo lo que quieren --check (probar sin dejar una sesión colgando) y
+    --fresh (garantizar un Hermes nuevo aunque haya uno vivo).
+    """
+    parts = urllib.parse.urlsplit(base)
+    scheme = "wss" if parts.scheme == "https" else "ws"
+    query = {"ticket": ticket, "channel": "herdr"}
+    if keepalive:
+        query["attach"] = attach_token()
+    if fresh:
+        query["fresh"] = "1"
+    return urllib.parse.urlunsplit(
+        (scheme, parts.netloc, "/api/pty", urllib.parse.urlencode(query), "")
+    )
+
+
+def needs_fresh_start(client: HermesClient) -> bool:
+    """¿Hay que arrancar en limpio para no toparse con `session not found`?
+
+    Si la sesión que anotamos sigue viva, el rastro del servidor apunta a lo mismo
+    y conectar sin más reanuda bien. Si no la hay o ya no existe, ese rastro es lo
+    único que decidiría qué reanudar y no está validado, así que forzamos limpio.
+    """
+    known = read_known_session()
+    if known and client.session_exists(known):
+        return False
+    write_known_session("")
+    return True
+
+
+def remember_session(client: HermesClient, previous: str) -> None:
+    """Guarda la sesión con la que se queda el panel al soltarlo.
+
+    Solo se anota si durante la conexión ha aparecido una sesión de TUI nueva. Si
+    no ha aparecido ninguna, es que no se llegó a escribir nada: esa sesión no se
+    ha persistido y reanudarla es justo lo que produce el error, así que se deja
+    el registro vacío para que la próxima apertura arranque limpia.
+    """
+    try:
+        newest = client.newest_tui_session()
+    except HermesAuthError:
+        return
+    if newest and newest != previous:
+        write_known_session(newest)
+
+
+def reexec_as_agent() -> None:
+    """Relanza el proceso con argv[0] = "hermes" para que herdr lo detecte.
+
+    El guardia por variable de entorno evita el bucle: el proceso relanzado ya
+    la trae puesta. Si el exec falla seguimos igualmente; solo se pierde la
+    identificación como agente, no la sesión.
+    """
+    if os.environ.get(REEXEC_FLAG) == "1":
+        return
+    os.environ[REEXEC_FLAG] = "1"
+    script = os.path.realpath(__file__)
+    try:
+        os.execv(sys.executable, [AGENT_ARGV0, script, *sys.argv[1:]])
+    except OSError:
+        pass
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="TUI de Hermes Agent dentro de herdr")
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="ignorar la sesión guardada y arrancar Hermes de cero",
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="descartar el PTY persistente y arrancar uno nuevo, también persistente",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="probar login, ticket y handshake, y salir",
+    )
+    args = parser.parse_args()
+
+    env = load_env()
+    missing = [k for k in ("HERMES_URL", "HERMES_USER", "HERMES_PASSWORD") if not env.get(k)]
+    if missing:
+        sys.stderr.write(
+            f"Faltan {', '.join(missing)} en {config_dirs()[0]}/.env\n"
+            "Formato:\n"
+            "  HERMES_URL=http://hermes.home:9119\n"
+            "  HERMES_USER=usuario\n"
+            "  HERMES_PASSWORD=contraseña\n"
+        )
+        return 2
+
+    base = env["HERMES_URL"]
+    client = HermesClient(
+        base, env["HERMES_USER"], env["HERMES_PASSWORD"], env.get("HERMES_PROVIDER", "basic")
+    )
+
+    if args.check:
+        try:
+            client.login()
+            print(f"login      OK  ({base})")
+            known = read_known_session()
+            if not known:
+                print("sesión     sin sesión anotada: el panel arrancará en limpio")
+            elif client.session_exists(known):
+                print(f"sesión     OK  se reanudará {known}")
+            else:
+                print(f"sesión     {known} ya no existe: el panel arrancará en limpio")
+            ticket = client.ws_ticket()
+            print(f"ws-ticket  OK  ({ticket[:8]}…)")
+            ws = WebSocket.connect(
+                build_ws_url(base, ticket, args.fresh, keepalive=False)
+            )
+            print("pty        OK  handshake aceptado")
+            # El servidor acepta el upgrade y solo después cierra si el chat
+            # embebido no está disponible, así que hay que leer para saberlo.
+            ws.sock.settimeout(5.0)
+            try:
+                first = ws.recv()
+            except WSClosed as closed:
+                detail = CLOSE_REASONS.get(closed.code, closed.reason or "sin motivo")
+                print(f"pty        FALLO ({closed.code}): {detail}")
+                return 1
+            except (TimeoutError, socket.timeout):
+                print("pty        sin salida en 5 s (el PTY tarda en arrancar)")
+            else:
+                print(f"pty        OK  {len(first)} bytes de la TUI recibidos")
+            ws.close()
+        except (HermesAuthError, ConnectionError, WSClosed, OSError) as exc:
+            print(f"FALLO: {exc}")
+            return 1
+        return 0
+
+    # Login + ticket + handshake. El ticket caduca en 30 s, así que se pide justo
+    # antes de conectar; la comprobación de la sesión va primero, con la sesión
+    # HTTP ya abierta.
+    try:
+        client.login()
+        if args.reset:
+            token = bump_generation()
+            sys.stderr.write(f"Sesión reiniciada: PTY nuevo ({token}).\n")
+        if args.fresh or args.reset:
+            write_known_session("")
+            fresh = True
+        else:
+            fresh = needs_fresh_start(client)
+        previous = client.newest_tui_session()
+        ws = WebSocket.connect(
+            build_ws_url(base, client.ws_ticket(), fresh, keepalive=not args.fresh)
+        )
+    except (HermesAuthError, ConnectionError, WSClosed, OSError) as exc:
+        sys.stderr.write(f"No se pudo conectar con Hermes: {exc}\n")
+        return 1
+
+    try:
+        return bridge(ws)
+    finally:
+        ws.close()
+        remember_session(client, previous)
+
+
+if __name__ == "__main__":
+    try:
+        reexec_as_agent()
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
