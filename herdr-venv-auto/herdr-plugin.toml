@@ -1,0 +1,31 @@
+id = "herdr-venv-auto"
+name = "Herdr venv auto"
+version = "0.1.0"
+min_herdr_version = "0.7.1"
+description = "Activa el venv del proyecto al entrar en su carpeta y lo desactiva al salir. Busca .venv/venv/env subiendo por los directorios padres."
+platforms = ["linux", "macos"]
+
+# Sin [[events]] a propósito. herdr sí emite pane.updated con el cwd nuevo en
+# cada cd, pero la única forma de activar un venv desde un evento es teclear
+# "source .venv/bin/activate" en el pane con send-text, y eso acaba escribiendo
+# dentro de vim, de un agente o de un comando en marcha. El trabajo lo hace
+# shell/hook.zsh (hook chpwd), que vive dentro del shell y no inyecta nada.
+# Este manifiesto empaqueta el hook, su config y las acciones.
+
+[[actions]]
+id = "status"
+title = "venv auto: qué venv resuelve este pane"
+contexts = ["global"]
+command = ["bash", "venv-auto.sh", "status"]
+
+[[actions]]
+id = "install-hook"
+title = "venv auto: añadir el hook a ~/.zshrc"
+contexts = ["global"]
+command = ["bash", "venv-auto.sh", "install-hook"]
+
+[[actions]]
+id = "uninstall-hook"
+title = "venv auto: quitar el hook de ~/.zshrc"
+contexts = ["global"]
+command = ["bash", "venv-auto.sh", "uninstall-hook"]
