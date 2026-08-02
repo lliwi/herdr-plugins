@@ -16,6 +16,13 @@ redimensionado, que el servidor consume sin pasarlo al PTY:
 `attach` mantiene el PTY vivo aunque se cierre el panel: al reabrirlo se reengancha
 a la misma sesión en vez de arrancar Hermes de cero.
 
+El pegado necesita ayuda porque Hermes corre en el servidor: cuando herdr entrega
+un Ctrl+V al panel, la TUI remota mira *su* portapapeles —el del servidor, vacío—
+y no pasa nada. Así que el puente atiende él mismo el Ctrl+V: lee el portapapeles
+local y, si es texto, lo inyecta como pegado con corchetes; si es una imagen, la
+sube a /api/chat/image-upload y teclea el `/image <ruta>` que devuelve. Es lo
+mismo que hace la página /chat del dashboard, y por el mismo motivo.
+
 Cuando el servidor tiene que arrancar un PTY nuevo decide qué sesión reanudar
 leyendo un fichero temporal propio de cada `channel`, donde la TUI apunta su sesión
 actual. Ese rastro no se valida: si la sesión que nombra ya no está en la base de
@@ -47,12 +54,15 @@ import json
 import os
 import re
 import select
+import shutil
 import signal
 import socket
 import ssl
 import struct
+import subprocess
 import sys
 import termios
+import time
 import tty
 import urllib.error
 import urllib.parse
@@ -80,6 +90,26 @@ CLOSE_REASONS = {
     4408: "este cliente no está permitido por el servidor",
     4410: "el proceso de Hermes ha terminado",
 }
+
+# Ctrl+V. herdr lo entrega crudo al panel (no lo traduce a un pegado con
+# corchetes: eso solo lo hace con el pegado propio del terminal, Ctrl+Shift+V),
+# así que es la tecla que interceptamos para hacer el pegado nosotros.
+PASTE_KEY = 0x16
+
+# Formatos de imagen que acepta /api/chat/image-upload, por orden de preferencia.
+IMAGE_MIMES = ("image/png", "image/webp", "image/jpeg", "image/gif", "image/bmp")
+IMAGE_EXTENSIONS = {
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/jpeg": "jpg",
+    "image/gif": "gif",
+    "image/bmp": "bmp",
+}
+
+# `/image` vacía el prompt, así que reponemos lo que hubiera escrito. Hay que
+# esperar a que la TUI remota procese el comando: si el texto llega antes, se lo
+# lleva por delante el mismo borrado. Es un margen, no un acuse de recibo.
+REPLAY_DELAY = 0.4
 
 
 # --------------------------------------------------------------------------- #
@@ -209,6 +239,88 @@ def bump_generation() -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Portapapeles local
+# --------------------------------------------------------------------------- #
+#
+# El de la máquina donde corre herdr, que es el único que ve lo que copia el
+# usuario. Devolvemos ("image", bytes, mime) o ("text", bytes, "text/plain").
+
+def run_tool(argv: list[str], timeout: float = 5.0) -> bytes | None:
+    """Ejecuta una herramienta del portapapeles. None si no hay nada que sacar."""
+    try:
+        done = subprocess.run(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout if done.returncode == 0 and done.stdout else None
+
+
+def pick_image(types: list[str]) -> str:
+    """Primer formato de imagen que ofrezca el portapapeles y sepamos subir."""
+    for mime in IMAGE_MIMES:
+        if mime in types:
+            return mime
+    return ""
+
+
+def wayland_clipboard() -> tuple[str, bytes, str] | None:
+    if not shutil.which("wl-paste"):
+        return None
+    listed = run_tool(["wl-paste", "--list-types"])
+    if listed is None:
+        return None
+    types = listed.decode("utf-8", "replace").split()
+    mime = pick_image(types)
+    if mime:
+        data = run_tool(["wl-paste", "--no-newline", "--type", mime])
+        if data:
+            return ("image", data, mime)
+    # --no-newline evita el salto que wl-paste añade y que enviaría el prompt.
+    data = run_tool(["wl-paste", "--no-newline"])
+    return ("text", data, "text/plain") if data else None
+
+
+def x11_clipboard() -> tuple[str, bytes, str] | None:
+    if not shutil.which("xclip"):
+        return None
+    listed = run_tool(["xclip", "-selection", "clipboard", "-t", "TARGETS", "-o"])
+    types = listed.decode("utf-8", "replace").split() if listed else []
+    mime = pick_image(types)
+    if mime:
+        data = run_tool(["xclip", "-selection", "clipboard", "-t", mime, "-o"])
+        if data:
+            return ("image", data, mime)
+    data = run_tool(["xclip", "-selection", "clipboard", "-o"])
+    return ("text", data, "text/plain") if data else None
+
+
+def macos_clipboard() -> tuple[str, bytes, str] | None:
+    if shutil.which("pngpaste"):
+        data = run_tool(["pngpaste", "-"])
+        if data:
+            return ("image", data, "image/png")
+    if shutil.which("pbpaste"):
+        data = run_tool(["pbpaste"])
+        if data:
+            return ("text", data, "text/plain")
+    return None
+
+
+def read_clipboard() -> tuple[str, bytes, str] | None:
+    """Contenido del portapapeles local, o None si está vacío o no se puede leer."""
+    if sys.platform == "darwin":
+        return macos_clipboard()
+    if os.environ.get("WAYLAND_DISPLAY"):
+        found = wayland_clipboard()
+        if found:
+            return found
+    if os.environ.get("DISPLAY"):
+        return x11_clipboard()
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # HTTP: login + ticket
 # --------------------------------------------------------------------------- #
 
@@ -261,6 +373,24 @@ class HermesClient:
         if not ticket:
             raise HermesAuthError("el servidor no ha devuelto ticket")
         return ticket
+
+    def upload_image(self, data: bytes, mime: str) -> str:
+        """Sube una imagen y devuelve su ruta *en el servidor*, lista para /image.
+
+        El endpoint existe justo para esto: la página /chat del dashboard tampoco
+        puede enseñarle al servidor el portapapeles del navegador, así que manda
+        los bytes y usa la ruta que le devuelven. Aterrizan en HERMES_HOME/images/,
+        el mismo sitio del que ya tira `clipboard.paste`.
+        """
+        extension = IMAGE_EXTENSIONS.get(mime, "png")
+        payload = {
+            "data_url": f"data:{mime};base64," + base64.b64encode(data).decode("ascii"),
+            "filename": f"herdr-{workspace_slug()}-{int(time.time())}.{extension}",
+        }
+        path = self._post("/api/chat/image-upload", payload).get("path")
+        if not path:
+            raise HermesAuthError("la subida no devolvió ninguna ruta")
+        return str(path)
 
     def _get(self, path: str) -> tuple[int, dict]:
         """GET que devuelve (código, cuerpo). El 404 es una respuesta, no un error."""
@@ -462,11 +592,116 @@ def notice(text: str) -> None:
     sys.stdout.flush()
 
 
-def bridge(ws: WebSocket) -> int:
+class TypedText:
+    """Aproxima lo que hay escrito en el prompt remoto mirando las pulsaciones.
+
+    Solo se usa para reponer el prompt después de un `/image`, que lo vacía. No
+    intenta emular al editor de línea de la TUI: en cuanto llega algo que no
+    sabemos interpretar —flechas, chords, historial— se marca como no fiable y
+    se deja de reponer hasta el siguiente envío. Reponer texto que el usuario ya
+    había borrado sería peor que no reponer nada.
+    """
+
+    # Contenido de un pegado con corchetes: lo que va dentro es texto literal.
+    BRACKETED = re.compile(rb"\x1b\[200~(.*?)\x1b\[201~", re.DOTALL)
+
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+        self.reliable = True
+
+    def observe(self, data: bytes) -> None:
+        """Pasa por aquí todo lo que se manda al PTY, pegados incluidos."""
+        cursor = 0
+        for match in self.BRACKETED.finditer(data):
+            self._observe_keys(data[cursor:match.start()])
+            self.buffer += match.group(1)
+            cursor = match.end()
+        self._observe_keys(data[cursor:])
+
+    def _observe_keys(self, data: bytes) -> None:
+        for byte in data:
+            if byte in (0x0D, 0x0A):  # enviado: prompt limpio y cuenta nueva
+                self.buffer.clear()
+                self.reliable = True
+            elif byte in (0x7F, 0x08):  # borrar: quita un carácter, no un byte
+                while self.buffer and 0x80 <= self.buffer[-1] <= 0xBF:
+                    self.buffer.pop()
+                if self.buffer:
+                    self.buffer.pop()
+            elif byte >= 0x20:
+                self.buffer += bytes([byte])
+            else:
+                self.reliable = False
+
+    def take(self) -> bytes:
+        """Devuelve lo escrito y da el prompt por vaciado."""
+        pending = bytes(self.buffer) if self.reliable else b""
+        self.buffer.clear()
+        self.reliable = True
+        return pending
+
+
+def paste_text(ws: WebSocket, text: bytes) -> None:
+    """Inyecta texto como pegado con corchetes: la TUI así no lo envía por los \\n."""
+    ws.send(b"\x1b[200~" + text.replace(b"\x1b[201~", b"") + b"\x1b[201~")
+
+
+def handle_paste(ws: WebSocket, client: HermesClient, typed: TypedText) -> bytes:
+    """Atiende un Ctrl+V con el portapapeles local.
+
+    Devuelve el texto que haya que reponer en el prompt más tarde (ver
+    REPLAY_DELAY), o b"" si no hay nada pendiente.
+    """
+    grabbed = read_clipboard()
+    if grabbed is None:
+        # Nada que pegar (o no hay herramienta): que el Ctrl+V siga su camino,
+        # por si la TUI remota quiere hacer algo con él.
+        ws.send(bytes([PASTE_KEY]))
+        return b""
+
+    kind, payload, mime = grabbed
+    if kind == "text":
+        paste_text(ws, payload)
+        typed.observe(payload)
+        return b""
+
+    try:
+        path = client.upload_image(payload, mime)
+    except (HermesAuthError, OSError) as exc:
+        notice(f"No se pudo subir la imagen: {exc}")
+        return b""
+
+    pending = typed.take()
+    ws.send(f"/image {path}\r".encode("utf-8"))
+    return pending
+
+
+def forward_stdin(
+    ws: WebSocket, client: HermesClient, typed: TypedText, data: bytes
+) -> bytes:
+    """Manda al PTY lo tecleado, sacando los Ctrl+V para atenderlos aquí.
+
+    El Ctrl+V puede venir pegado a otras pulsaciones en la misma lectura, así que
+    se trocea en vez de mirar solo el primer byte. Devuelve el texto pendiente de
+    reponer, si el pegado ha sido de imagen.
+    """
+    pending = b""
+    for index, chunk in enumerate(data.split(bytes([PASTE_KEY]))):
+        if index:
+            pending = handle_paste(ws, client, typed) or pending
+        if chunk:
+            ws.send(chunk)
+            typed.observe(chunk)
+    return pending
+
+
+def bridge(ws: WebSocket, client: HermesClient) -> int:
     """Bombea stdin -> websocket -> stdout hasta que uno de los dos se cierre."""
     stdin_fd = sys.stdin.fileno()
     stdout_fd = sys.stdout.fileno()
     saved = termios.tcgetattr(stdin_fd)
+    typed = TypedText()
+    replay: tuple[float, bytes] | None = None  # (cuándo, qué) tras un /image
 
     # El manejador de SIGWINCH solo escribe en la tubería; el trabajo real se
     # hace en el bucle para no reentrar en el socket desde una señal.
@@ -479,10 +714,16 @@ def bridge(ws: WebSocket) -> int:
         tty.setraw(stdin_fd)
         send_resize(ws)
         while True:
+            timeout = max(0.0, replay[0] - time.monotonic()) if replay else None
             try:
-                ready, _, _ = select.select([stdin_fd, ws.sock, wake_r], [], [])
+                ready, _, _ = select.select([stdin_fd, ws.sock, wake_r], [], [], timeout)
             except InterruptedError:
                 continue
+
+            if replay and time.monotonic() >= replay[0]:
+                paste_text(ws, replay[1])
+                typed.observe(replay[1])
+                replay = None
 
             if wake_r in ready:
                 try:
@@ -500,7 +741,9 @@ def bridge(ws: WebSocket) -> int:
                     data = b""
                 if not data:
                     return 0
-                ws.send(data)
+                pending = forward_stdin(ws, client, typed, data)
+                if pending:
+                    replay = (time.monotonic() + REPLAY_DELAY, pending)
 
             if ws.sock in ready:
                 data = ws.recv()
@@ -689,7 +932,7 @@ def main() -> int:
         return 1
 
     try:
-        return bridge(ws)
+        return bridge(ws, client)
     finally:
         ws.close()
         remember_session(client, previous)

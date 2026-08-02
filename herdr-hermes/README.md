@@ -64,11 +64,38 @@ token de `attach`, con lo que el servidor no encuentra nada con esa clave y arra
 un PTY nuevo. La generación se guarda, así que las aperturas siguientes se
 reenganchan a él con normalidad y el panel sigue siendo persistente.
 
+### Pegar texto e imágenes
+
+Hermes corre en el servidor, así que su portapapeles es el del servidor: cuando la
+TUI atiende un Ctrl+V y va a mirar qué has copiado, no encuentra nada. Por eso el
+puente atiende él mismo el Ctrl+V, lee el portapapeles **local** y lo inyecta:
+
+- **texto** → lo manda como pegado con corchetes (`ESC[200~…ESC[201~`), que es lo
+  que evita que la TUI envíe el prompt al llegar a un salto de línea;
+- **imagen** → la sube a `POST /api/chat/image-upload` y teclea el `/image <ruta>`
+  que devuelve. Es exactamente lo que hace la página `/chat` del dashboard, y por
+  el mismo motivo: los bytes del portapapeles del cliente no los ve el servidor.
+  Los ficheros aterrizan en `HERMES_HOME/images/`.
+
+Si el portapapeles está vacío o no hay herramienta para leerlo, el Ctrl+V se manda
+tal cual a la TUI remota, como antes.
+
+`/image` vacía el prompt, así que el puente repone lo que hubiera escrito. Para
+saber qué reponer va siguiendo las pulsaciones, y si ve algo que no sabe
+interpretar (flechas, historial, chords) prefiere no reponer nada antes que
+reponer texto que ya habías borrado.
+
+El pegado propio del terminal (**Ctrl+Shift+V** en kitty) siempre ha funcionado
+para texto y sigue igual: herdr entrega esos bytes ya envueltos en corchetes y el
+puente no los toca.
+
 ## Requisitos
 
 - Python 3.9+
 - En el servidor: extras `web` y `pty` de Hermes (`uv pip install -e '.[web]'`).
   Sin `pty` el dashboard rechaza el websocket con código 4404.
+- Para pegar desde el portapapeles local: `wl-clipboard` (Wayland) o `xclip` (X11);
+  en macOS, `pbpaste` y `pngpaste` para las imágenes.
 
 ## Configuración
 
