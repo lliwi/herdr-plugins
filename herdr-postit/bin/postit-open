@@ -1,0 +1,98 @@
+#!/bin/sh
+# Abre el tablero en un panel de herdr, en el directorio del panel enfocado: así
+# la tecla p (ver solo lo de este proyecto) ya arranca apuntando donde estabas.
+set -eu
+
+HERDR="${HERDR_BIN_PATH:-herdr}"
+mode="${1:-split}"
+TAB_NAME="${POSTIT_TAB_NAME:-herdr-postit}"
+
+# El contexto llega como JSON y su forma no está fijada, así que se prueban los
+# sitios donde puede venir el directorio antes de rendirse.
+dir="$(python3 -c '
+import json, os
+try:
+    data = json.loads(os.environ.get("HERDR_PLUGIN_CONTEXT_JSON") or "{}")
+except ValueError:
+    data = {}
+
+
+def dig(*path):
+    node = data
+    for key in path:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    return node if isinstance(node, str) and node else None
+
+
+print(dig("focused_pane_cwd") or dig("focused_pane", "cwd") or dig("pane", "cwd")
+      or dig("workspace_cwd") or dig("workspace", "cwd") or "")
+' 2>/dev/null || true)"
+[ -n "$dir" ] && [ -d "$dir" ] || dir="$HOME"
+
+# El nombre que luce ahora mismo una pestaña (con el prefijo [N] que le pone el
+# renombrado automático, si lo lleva).
+tab_label() {
+  "$HERDR" tab list 2>/dev/null | POSTIT_TAB="$1" python3 -c '
+import json, os, sys
+want = os.environ["POSTIT_TAB"]
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+for tab in (data.get("result") or data).get("tabs") or []:
+    if tab.get("tab_id") == want:
+        print(tab.get("label") or "")
+        break
+' 2>/dev/null || true
+}
+
+case "$mode" in
+  popup)
+    exec "$HERDR" plugin pane open --plugin postit --entrypoint popup --cwd "$dir"
+    ;;
+  tab)
+    # La pestaña nace llamándose como el programa que corre dentro (python3).
+    out="$("$HERDR" plugin pane open --plugin postit --entrypoint board \
+      --placement tab --cwd "$dir")"
+    tab="$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+pane = ((data.get("result") or {}).get("plugin_pane") or {}).get("pane") or {}
+print(pane.get("tab_id") or "")
+' 2>/dev/null)" || tab=""
+    [ -n "$tab" ] || exit 0
+
+    # El plugin de renombrado automático nombra las pestañas por el programa que
+    # tienen dentro, y llega a esta justo después que nosotros. No se puede ganar
+    # la carrera, así que se insiste: en cuanto ve un nombre que no puso él, la
+    # da por bautizada a mano y deja de tocarla. Dos lecturas seguidas con el
+    # nombre puesto = ya no hay pelea.
+    ok=0
+    tries=0
+    while [ "$tries" -lt 8 ]; do
+      case "$(tab_label "$tab")" in
+        *"$TAB_NAME")
+          ok=$((ok + 1))
+          ;;
+        *)
+          ok=0
+          "$HERDR" tab rename "$tab" "$TAB_NAME" >/dev/null 2>&1 || true
+          ;;
+      esac
+      if [ "$ok" -ge 2 ]; then
+        break
+      fi
+      tries=$((tries + 1))
+      sleep 0.4
+    done
+    ;;
+  *)
+    exec "$HERDR" plugin pane open --plugin postit --entrypoint board \
+      --placement split --direction right --cwd "$dir"
+    ;;
+esac

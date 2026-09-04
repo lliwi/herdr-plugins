@@ -1,0 +1,1872 @@
+#!/usr/bin/env python3
+"""postit — tablero de notas tipo postit en el terminal.
+
+Una tarjeta es un postit: un fichero Markdown en ~/.local/share/postit/notes/
+con un nombre y una lista de líneas que va creciendo.
+
+    ---
+    color: rosa
+    pinned: true
+    created: 2026-09-03T21:39
+    scope: /home/llibert/Documents/development
+    ---
+    trabajo
+
+    - Llamar a soporte de la impresora
+    - Revisar ISMS-manager
+
+`postit add trabajo "firmar el contrato"` añade una línea a esa tarjeta; no crea
+una tarjeta nueva. Si la tarjeta no existe, se crea.
+
+El nombre del fichero es el slug del nombre de la tarjeta, así que `trabajo` y
+`Trabajo` son la misma. La primera línea del cuerpo es el nombre tal y como se
+escribió; el resto es contenido libre — las líneas que empiezan por `-` cuentan
+como ítems, pero editar la tarjeta con nvim y escribir lo que sea también vale:
+se muestra igual.
+
+La fecha que se ve y por la que se ordena es el mtime del fichero, no un campo
+del frontmatter: un campo así solo lo actualizaría esta app y empezaría a mentir
+en cuanto editaras la tarjeta por fuera.
+
+El tablero busca con `/` (sin acentos, todas las palabras), filtra por proyecto
+con `p` —el proyecto es el repo, no el directorio— y cambia el orden con `s`.
+
+El índice de ~/.local/state/postit/index.json es solo una caché: guarda el
+frontmatter y las primeras líneas ya parseadas, con el mtime y el tamaño de cada
+fichero. Borrarlo no pierde nada.
+
+Solo biblioteca estándar.
+"""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import json
+import locale
+import os
+import re
+import sys
+import shlex
+import shutil
+import subprocess
+import textwrap
+import time
+import unicodedata
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+
+# ---------------------------------------------------------------- rutas
+
+def _xdg(var: str, default: str) -> Path:
+    raw = os.environ.get(var)
+    return Path(raw) if raw else Path.home() / default
+
+
+HOME = Path(os.environ.get("POSTIT_HOME") or _xdg("XDG_DATA_HOME", ".local/share") / "postit")
+NOTES_DIR = HOME / "notes"
+STATE_DIR = _xdg("XDG_STATE_HOME", ".local/state") / "postit"
+INDEX_PATH = STATE_DIR / "index.json"
+
+# ---------------------------------------------------------------- colores
+
+# Pasteles de la paleta de 256; el texto va en gris oscuro sobre ellos.
+COLORS = {
+    "amarillo": 229,
+    "rosa": 218,
+    "naranja": 216,
+    "verde": 194,
+    "azul": 153,
+    "morado": 183,
+    "gris": 252,
+}
+DEFAULT_COLOR = "amarillo"
+
+# El mismo color, apagado. Lo llevan las tarjetas que no están seleccionadas: la
+# seleccionada es la única encendida, que se ve de un vistazo sin tener que
+# buscar el borde. Todos son claros de sobra para el texto en 236.
+MUTED = {
+    "amarillo": 187,
+    "rosa": 181,
+    "naranja": 180,
+    "verde": 151,
+    "azul": 146,
+    "morado": 182,
+    "gris": 249,
+}
+
+# Cuando el terminal no llega a 256 colores.
+BASIC = {
+    "amarillo": curses.COLOR_YELLOW,
+    "rosa": curses.COLOR_MAGENTA,
+    "naranja": curses.COLOR_RED,
+    "verde": curses.COLOR_GREEN,
+    "azul": curses.COLOR_CYAN,
+    "morado": curses.COLOR_MAGENTA,
+    "gris": curses.COLOR_WHITE,
+}
+
+# ---------------------------------------------------------------- frontmatter
+
+_FM_RE = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n?", re.S)
+_ITEM_RE = re.compile(r"^(\s*)[-*+]\s+(.*)$")
+_DONE_RE = re.compile(r"^\[([ xX])\]\s*(.*)$")
+
+
+def _scalar(raw: str):
+    raw = raw.strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        return [x.strip().strip("'\"") for x in raw[1:-1].split(",") if x.strip()]
+    if raw in ("true", "false"):
+        return raw == "true"
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+        return raw[1:-1]
+    return raw
+
+
+def parse_front(text: str) -> tuple[dict, str]:
+    """Separa frontmatter y cuerpo. Sin frontmatter, todo es cuerpo."""
+    m = _FM_RE.match(text)
+    if not m:
+        return {}, text
+    meta = {}
+    for line in m.group(1).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition(":")
+        if sep:
+            meta[key.strip()] = _scalar(value)
+    return meta, text[m.end():]
+
+
+def dump_front(meta: dict) -> str:
+    out = ["---"]
+    for key, value in meta.items():
+        if isinstance(value, bool):
+            value = "true" if value else "false"
+        elif isinstance(value, list):
+            value = "[" + ", ".join(str(v) for v in value) + "]"
+        out.append(f"{key}: {value}")
+    out.append("---")
+    return "\n".join(out) + "\n"
+
+# ---------------------------------------------------------------- tarjetas
+
+PREVIEW_LINES = 12  # lo que se guarda en la caché; la tarjeta pinta menos
+
+
+@dataclass
+class Card:
+    id: str                       # slug = nombre del fichero sin .md
+    path: Path
+    mtime: float = 0.0
+    color: str = DEFAULT_COLOR
+    pinned: bool = False
+    created: str = ""
+    scope: str = ""
+    title: str = ""               # nombre tal y como se escribió
+    lines: list = field(default_factory=list)
+    n_items: int = 0
+    n_done: int = 0
+
+    def read(self) -> tuple[dict, str]:
+        meta, body = parse_front(_read(self.path))
+        return meta, body.strip("\n")
+
+    def body_lines(self) -> list[str]:
+        _, body = self.read()
+        rest = body.splitlines()[1:]
+        while rest and not rest[0].strip():
+            rest.pop(0)
+        return [l.rstrip() for l in rest]
+
+
+def _read(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def item_parts(line: str) -> tuple[bool | None, str] | None:
+    """(hecho, texto) de una línea de lista, o None si no lo es.
+
+    `hecho` es None cuando el ítem no lleva casilla (`- comprar café`), y True o
+    False cuando la lleva (`- [x] …` / `- [ ] …`). Un ítem sin casilla se trata
+    como pendiente en todos lados; la casilla solo aparece si se marca."""
+    m = _ITEM_RE.match(line)
+    if not m:
+        return None
+    body = m.group(2).strip()
+    done = _DONE_RE.match(body)
+    if done:
+        return done.group(1).lower() == "x", done.group(2).strip()
+    return None, body
+
+
+def item_text(line: str) -> str | None:
+    parts = item_parts(line)
+    return parts[1] if parts else None
+
+
+def toggle_done(line: str) -> str:
+    """Alterna la casilla de un ítem, poniéndosela si no la tenía."""
+    m = _ITEM_RE.match(line)
+    if not m:
+        return line
+    indent, done_text = m.group(1), item_parts(line)
+    done, text = done_text
+    return f"{indent}- [{'x' if not done else ' '}] {text}"
+
+
+def set_item_text(line: str, text: str) -> str:
+    """Cambia el texto de un ítem conservando sangría y casilla."""
+    m = _ITEM_RE.match(line)
+    if not m:
+        return text
+    done, _ = item_parts(line)
+    if done is None:
+        return f"{m.group(1)}- {text}"
+    return f"{m.group(1)}- [{'x' if done else ' '}] {text}"
+
+
+def indent_of(line: str) -> str:
+    m = _ITEM_RE.match(line)
+    return m.group(1) if m else ""
+
+
+def reindent(line: str, delta: int, limit: int = 6) -> str:
+    """Sangra o dessangra un ítem; los sub-ítems son ítems con espacios delante."""
+    m = _ITEM_RE.match(line)
+    if not m:
+        return line
+    width = max(0, min(limit, len(m.group(1)) + delta))
+    return " " * width + line.lstrip()
+
+
+def item_indices(lines: list[str]) -> list[int]:
+    return [i for i, l in enumerate(lines) if item_parts(l) is not None]
+
+
+def card_from_file(path: Path, mtime: float) -> Card:
+    meta, body = parse_front(_read(path))
+    lines = body.strip("\n").splitlines()
+    title = lines[0].strip() if lines else ""
+    rest = lines[1:]
+    while rest and not rest[0].strip():
+        rest.pop(0)
+    color = str(meta.get("color") or DEFAULT_COLOR)
+    return Card(
+        id=path.stem,
+        path=path,
+        mtime=mtime,
+        color=color if color in COLORS else DEFAULT_COLOR,
+        pinned=bool(meta.get("pinned")),
+        created=str(meta.get("created") or ""),
+        scope=str(meta.get("scope") or ""),
+        title=title or path.stem,
+        lines=[l.rstrip() for l in rest[:PREVIEW_LINES]],
+        n_items=sum(1 for l in rest if item_parts(l) is not None),
+        n_done=sum(1 for l in rest if (item_parts(l) or (None,))[0]),
+    )
+
+# ---------------------------------------------------------------- índice
+
+def _read_index() -> dict:
+    """Caché de la carpeta actual. Las claves son nombres de fichero, así que
+    una caché escrita para otro POSTIT_HOME no vale: se guarda el directorio
+    dentro y se descarta entera si no coincide."""
+    try:
+        data = json.loads(INDEX_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict) or data.get("dir") != str(NOTES_DIR):
+        return {}
+    files = data.get("files")
+    return files if isinstance(files, dict) else {}
+
+
+def _write_index(index: dict) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = INDEX_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"dir": str(NOTES_DIR), "files": index}), encoding="utf-8")
+        os.replace(tmp, INDEX_PATH)
+    except OSError:
+        pass  # la caché es prescindible; nunca debe tumbar la app
+
+
+def _to_cache(card: Card, size: int) -> dict:
+    return {
+        "mtime": card.mtime, "size": size, "color": card.color,
+        "pinned": card.pinned, "created": card.created, "scope": card.scope,
+        "title": card.title, "lines": card.lines,
+        "n_items": card.n_items, "n_done": card.n_done,
+    }
+
+
+def _from_cache(path: Path, entry: dict) -> Card:
+    return Card(
+        id=path.stem, path=path, mtime=entry.get("mtime", 0.0),
+        color=entry.get("color", DEFAULT_COLOR), pinned=bool(entry.get("pinned")),
+        created=entry.get("created", ""), scope=entry.get("scope", ""),
+        title=entry.get("title", ""), lines=list(entry.get("lines") or []),
+        n_items=int(entry.get("n_items") or 0), n_done=int(entry.get("n_done") or 0),
+    )
+
+
+def load_cards() -> list[Card]:
+    """Todas las tarjetas, fijadas primero y luego por mtime descendente."""
+    NOTES_DIR.mkdir(parents=True, exist_ok=True)
+    index = _read_index()
+    cards: list[Card] = []
+    seen: set[str] = set()
+    dirty = False
+
+    with os.scandir(NOTES_DIR) as it:
+        entries = [e for e in it if e.is_file() and e.name.endswith(".md")]
+    for entry in entries:
+        stat = entry.stat()
+        seen.add(entry.name)
+        cached = index.get(entry.name)
+        if cached and cached.get("mtime") == stat.st_mtime and cached.get("size") == stat.st_size:
+            cards.append(_from_cache(Path(entry.path), cached))
+            continue
+        card = card_from_file(Path(entry.path), stat.st_mtime)
+        index[entry.name] = _to_cache(card, stat.st_size)
+        cards.append(card)
+        dirty = True
+
+    for stale in set(index) - seen:
+        del index[stale]
+        dirty = True
+    if dirty:
+        _write_index(index)
+
+    cards.sort(key=lambda c: (not c.pinned, -c.mtime))
+    return cards
+
+
+# ------------------------------------------------------- buscar y ordenar
+
+_BODY_CACHE: dict[tuple[str, float], list[str]] = {}
+
+
+def fold(text: str) -> str:
+    """Sin acentos y en minúsculas: buscar `cafe` encuentra `café`."""
+    plain = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in plain if not unicodedata.combining(c)).lower()
+
+
+def body_of(card: Card) -> list[str]:
+    """Cuerpo entero, recordado por (fichero, mtime) mientras dure el proceso.
+
+    La caché de disco solo guarda las primeras líneas, que valen para pintar
+    pero no para buscar; esto lee el fichero una vez y ya."""
+    key = (str(card.path), card.mtime)
+    hit = _BODY_CACHE.get(key)
+    if hit is None:
+        if len(_BODY_CACHE) > 500:
+            _BODY_CACHE.clear()
+        hit = _BODY_CACHE[key] = card.body_lines()
+    return hit
+
+
+def matches(card: Card, query: str) -> bool:
+    """Todas las palabras de la consulta, en cualquier orden, en nombre o ítems."""
+    words = fold(query).split()
+    if not words:
+        return True
+    hay = fold(" ".join([card.id, card.title, *body_of(card)]))
+    return all(w in hay for w in words)
+
+
+def line_matches(line: str, words: list[str]) -> bool:
+    low = fold(line)
+    return bool(words) and all(w in low for w in words)
+
+
+_ROOTS: dict[str, str] = {}
+
+
+def project_root(path: str) -> str:
+    """La raíz del repo que contiene a `path`, o el propio directorio si no hay.
+
+    Comparar directorios a pelo no sirve: una tarjeta creada en la raíz del repo
+    no saldría estando en un subdirectorio, y una creada en $HOME saldría en
+    todos los proyectos porque $HOME está por encima de todo."""
+    hit = _ROOTS.get(path)
+    if hit is None:
+        here = Path(path)
+        hit = str(here)
+        for d in (here, *here.parents):
+            if (d / ".git").exists():
+                hit = str(d)
+                break
+        _ROOTS[path] = hit
+    return hit
+
+
+def in_scope(card: Card, cwd: str) -> bool:
+    """Del proyecto actual si nació en el mismo repo (o en el mismo directorio
+    suelto, si no hay repo)."""
+    scope = (card.scope or "").rstrip("/")
+    return bool(scope) and project_root(scope) == project_root(cwd.rstrip("/"))
+
+
+ORDERS = ("fecha", "nombre", "pendientes")
+
+
+def sort_cards(cards: list[Card], order: str) -> list[Card]:
+    """Las fijadas siempre arriba; debajo, el criterio que toque."""
+    if order == "nombre":
+        key = lambda c: (not c.pinned, fold(c.title or c.id))
+    elif order == "pendientes":
+        key = lambda c: (not c.pinned, -(c.n_items - c.n_done), -c.mtime)
+    else:
+        key = lambda c: (not c.pinned, -c.mtime)
+    return sorted(cards, key=key)
+
+
+def find_card(cards: list[Card], needle: str) -> Card | None:
+    """Resuelve por slug exacto, prefijo o trozo del nombre. None si no hay."""
+    want = slug(needle)
+    for card in cards:
+        if card.id == want:
+            return card
+    matches = [c for c in cards if c.id.startswith(want)]
+    if not matches:
+        low = needle.strip().lower()
+        matches = [c for c in cards if low and low in c.title.lower()]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        die(f"{needle!r} es ambiguo: {', '.join(c.id for c in matches[:5])}")
+    return matches[0]
+
+
+def require_card(needle: str) -> Card:
+    card = find_card(load_cards(), needle)
+    if card is None:
+        die(f"no hay ninguna tarjeta que coincida con {needle!r}")
+    return card
+
+# ---------------------------------------------------------------- escritura
+
+def slug(text: str, limit: int = 40) -> str:
+    plain = unicodedata.normalize("NFKD", text)
+    plain = "".join(c for c in plain if not unicodedata.combining(c))
+    plain = re.sub(r"[^a-zA-Z0-9]+", "-", plain).strip("-").lower()
+    return plain[:limit].strip("-") or "sin-nombre"
+
+
+def card_path(name: str) -> Path:
+    return NOTES_DIR / f"{slug(name)}.md"
+
+
+def write_card(path: Path, meta: dict, title: str, lines: list[str]) -> None:
+    """Escritura atómica: tmp en el mismo directorio y rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = dump_front(meta) + title.strip() + "\n"
+    body = "\n".join(lines).strip("\n")
+    if body:
+        text += "\n" + body + "\n"
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def save(card: Card, lines: list[str], *, title: str | None = None, **changes) -> None:
+    """Reescribe una tarjeta conservando lo que no se toca."""
+    meta, body = card.read()
+    meta.setdefault("color", card.color)
+    meta.setdefault("pinned", card.pinned)
+    meta.setdefault("created", card.created or datetime.now().strftime("%Y-%m-%dT%H:%M"))
+    meta.setdefault("scope", card.scope or os.getcwd())
+    meta.update({k: v for k, v in changes.items() if v is not None})
+    if title is None:
+        title = body.splitlines()[0] if body else card.title
+    write_card(card.path, meta, title, lines)
+
+# ---------------------------------------------------------------- formato
+
+def _char_w(ch: str) -> int:
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def disp_w(text: str) -> int:
+    return sum(_char_w(c) for c in text)
+
+
+def cut(text: str, width: int) -> str:
+    """Recorta a `width` columnas de pantalla, con … si sobra."""
+    if width <= 0:
+        return ""
+    if disp_w(text) <= width:
+        return text
+    out, used = [], 0
+    for ch in text:
+        w = _char_w(ch)
+        if used + w > width - 1:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out) + "…"
+
+
+def cols_slice(text: str, start: int, width: int) -> str:
+    """El trozo de `text` que cae entre las columnas [start, start+width)."""
+    out, col = [], 0
+    for ch in text:
+        w = _char_w(ch)
+        if col >= start + width:
+            break
+        if col >= start:
+            out.append(ch)
+        col += w
+    return "".join(out)
+
+
+def wrap(text: str, width: int) -> list[str]:
+    lines = []
+    for para in text.split("\n"):
+        if not para.strip():
+            lines.append("")
+        else:
+            lines.extend(textwrap.wrap(para, width) or [""])
+    return lines
+
+
+def bullet(line: str, mark: str | None = None) -> str:
+    """Los ítems se pintan con · (o ✓ si están hechos); el resto, tal cual."""
+    parts = item_parts(line)
+    if parts is None:
+        return line
+    done, text = parts
+    return indent_of(line) + (mark or ("✓ " if done else "· ")) + text
+
+
+def default_editor() -> str:
+    """Sin $VISUAL ni $EDITOR, el primero que exista de nvim, vim, vi."""
+    for candidate in ("nvim", "vim", "vi"):
+        if shutil.which(candidate):
+            return candidate
+    return "nvim"
+
+
+def ago(ts: float) -> str:
+    delta = time.time() - ts
+    if delta < 60:
+        return "ahora"
+    if delta < 3600:
+        return f"hace {int(delta // 60)} min"
+    if delta < 86400:
+        return f"hace {int(delta // 3600)} h"
+    if delta < 172800:
+        return "ayer"
+    stamp = datetime.fromtimestamp(ts)
+    if stamp.year == datetime.now().year:
+        return stamp.strftime("%-d %b")
+    return stamp.strftime("%-d %b %Y")
+
+# ---------------------------------------------------------------- TUI
+
+GAP = 1
+TARGET_W = 28
+CARD_H = 9
+MIN_W = 18
+
+PAIRS: dict[str, int] = {}
+
+
+def init_colors() -> None:
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+    except curses.error:
+        return
+    if not curses.has_colors():
+        return
+    rich = curses.COLORS >= 256
+    fg = 236 if rich else curses.COLOR_BLACK
+    i = 0
+    for name, code in COLORS.items():
+        for lit in (True, False):
+            i += 1
+            if rich:
+                bg = code if lit else MUTED.get(name, code)
+            else:
+                bg = BASIC[name]       # sin 256 colores no hay medio tono
+            try:
+                curses.init_pair(i, fg, bg)
+            except curses.error:
+                continue
+            PAIRS[(name, lit)] = i
+
+
+def attr_for(card: Card, lit: bool = True) -> int:
+    pair = PAIRS.get((card.color, lit))
+    return curses.color_pair(pair) if pair else curses.A_NORMAL
+
+
+def put(win, y: int, x: int, text: str, attr: int = 0) -> None:
+    """addstr que nunca revienta por salirse de la pantalla."""
+    maxy, maxx = win.getmaxyx()
+    if y < 0 or y >= maxy or x < 0 or x >= maxx:
+        return
+    text = cut(text, maxx - x)
+    if not text:
+        return
+    try:
+        win.addstr(y, x, text, attr)
+    except curses.error:
+        pass  # la última celda de la pantalla siempre falla
+
+
+TITLE = -1  # el "índice" que identifica al nombre de la tarjeta al editarlo
+
+
+class LineEdit:
+    """Una línea de texto en edición: buffer, cursor y desplazamiento lateral.
+
+    No pinta nada ni sabe dónde está; `key()` aplica una tecla y dice qué ha
+    pasado, `view()` da el trozo visible y la columna del cursor. La usan tanto
+    la barra de estado como la edición dentro de la tarjeta."""
+
+    def __init__(self, text: str = ""):
+        self.buf = list(text)
+        self.cur = len(self.buf)
+        self.scroll = 0
+
+    @property
+    def text(self) -> str:
+        return "".join(self.buf)
+
+    def view(self, width: int) -> tuple[str, int]:
+        width = max(1, width)
+        curx = disp_w("".join(self.buf[:self.cur]))
+        if curx < self.scroll:
+            self.scroll = curx
+        elif curx - self.scroll >= width:
+            self.scroll = curx - width + 1
+        return cols_slice(self.text, self.scroll, width), curx - self.scroll
+
+    def key(self, key) -> str:
+        """Aplica una tecla. Devuelve qué hacer: ok, enter, esc, tab, btab,
+        resize, up, down o nada."""
+        buf, cur = self.buf, self.cur
+        if isinstance(key, str):
+            if key in ("\n", "\r"):
+                return "enter"
+            if key == "\x1b":
+                return "esc"
+            if key == "\t":
+                return "tab"
+            if key in ("\x7f", "\b"):
+                if cur:
+                    del buf[cur - 1]
+                    self.cur -= 1
+                return "ok"
+            if key == "\x15":                      # ctrl-u: hasta el principio
+                del buf[:cur]
+                self.cur = 0
+                return "ok"
+            if key == "\x0b":                      # ctrl-k: hasta el final
+                del buf[cur:]
+                return "ok"
+            if key == "\x17":                      # ctrl-w: la palabra anterior
+                i = cur
+                while i and buf[i - 1].isspace():
+                    i -= 1
+                while i and not buf[i - 1].isspace():
+                    i -= 1
+                del buf[i:cur]
+                self.cur = i
+                return "ok"
+            if key == "\x01":                      # ctrl-a
+                self.cur = 0
+                return "ok"
+            if key == "\x05":                      # ctrl-e
+                self.cur = len(buf)
+                return "ok"
+            if key.isprintable():
+                buf.insert(cur, key)
+                self.cur += 1
+                return "ok"
+            return "nada"
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            if cur:
+                del buf[cur - 1]
+                self.cur -= 1
+        elif key == curses.KEY_DC:
+            if cur < len(buf):
+                del buf[cur]
+        elif key == curses.KEY_LEFT:
+            self.cur = max(0, cur - 1)
+        elif key == curses.KEY_RIGHT:
+            self.cur = min(len(buf), cur + 1)
+        elif key == curses.KEY_UP:
+            return "up"
+        elif key == curses.KEY_DOWN:
+            return "down"
+        elif key == curses.KEY_HOME:
+            self.cur = 0
+        elif key == curses.KEY_END:
+            self.cur = len(buf)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            return "enter"
+        elif key == curses.KEY_BTAB:
+            return "btab"
+        elif key == curses.KEY_RESIZE:
+            return "resize"
+        else:
+            return "nada"
+        return "ok"
+
+
+class Board:
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        self.all = load_cards()      # todas
+        self.cards = []              # las que se ven: filtradas y ordenadas
+        self.query = ""
+        self.only_scope = False
+        self.order = ORDERS[0]
+        self.cwd = os.getcwd()
+        self.sel = 0
+        self.top = 0
+        self.cols = 1
+        self.card_w = TARGET_W
+        self.rows_fit = 1
+        self.message = ""
+        self.apply()
+
+    # -- estado -------------------------------------------------------
+    def current(self) -> Card | None:
+        return self.cards[self.sel] if self.cards else None
+
+    def reload(self, keep: str | None = None) -> None:
+        keep = keep or (self.current().id if self.current() else None)
+        self.all = load_cards()
+        self.apply(keep)
+
+    def apply(self, keep: str | None = None) -> None:
+        """Rehace lo que se ve a partir del filtro, el proyecto y el orden."""
+        keep = keep or (self.current().id if self.current() else None)
+        cards = [c for c in self.all if matches(c, self.query)]
+        if self.only_scope:
+            cards = [c for c in cards if in_scope(c, self.cwd)]
+        self.cards = sort_cards(cards, self.order)
+        if not self.cards:
+            self.sel = 0
+            return
+        self.sel = next((i for i, c in enumerate(self.cards) if c.id == keep),
+                        min(self.sel, len(self.cards) - 1))
+
+    def preview(self, card: Card) -> list[str]:
+        """Lo que se pinta dentro de la tarjeta. Con filtro, lo que casa primero:
+        si no, buscas `café` y ves una tarjeta que no enseña por qué salió."""
+        if not self.query:
+            return card.lines
+        words = fold(self.query).split()
+        body = body_of(card)
+        hits = [i for i, l in enumerate(body) if line_matches(l, words)]
+        if not hits:
+            return body
+        rest = [i for i in range(len(body)) if i not in set(hits)]
+        return [body[i] for i in hits + rest]
+
+    # -- geometría ----------------------------------------------------
+    def measure(self) -> None:
+        maxy, maxx = self.stdscr.getmaxyx()
+        usable = max(maxx - GAP, MIN_W)
+        self.cols = max(1, (usable + GAP) // (TARGET_W + GAP))
+        # reparte el ancho sobrante entre las columnas en vez de dejarlo al borde
+        self.card_w = max(MIN_W, (usable - GAP * (self.cols - 1)) // self.cols)
+        self.rows_fit = max(1, (maxy - 1 + GAP) // (CARD_H + GAP))
+
+    def scroll_into_view(self) -> None:
+        row = self.sel // self.cols
+        if row < self.top:
+            self.top = row
+        elif row >= self.top + self.rows_fit:
+            self.top = row - self.rows_fit + 1
+
+    # -- teclado ------------------------------------------------------
+    def read_key(self) -> int:
+        """getch(), pero distinguiendo un Esc de verdad de una secuencia suelta.
+
+        Un panel recibe de vez en cuando secuencias que curses no reconoce
+        —respuestas a consultas del terminal, eventos de foco—, y todas empiezan
+        por Esc. Sin esto, el tablero se cerraba solo al abrirlo en herdr: leía
+        el Esc de una de ellas y lo tomaba por un `salir` del usuario."""
+        key = self.stdscr.getch()
+        if key != 27:
+            return key
+        self.stdscr.timeout(25)
+        try:
+            if self.stdscr.getch() == -1:
+                return 27              # no venía nada detrás: Esc de verdad
+            while self.stdscr.getch() != -1:
+                pass                   # el resto de la secuencia, a la basura
+            return -1
+        finally:
+            self.stdscr.timeout(-1)
+
+    def read_wch(self):
+        """Lo mismo para el texto: devuelve None si se comió una secuencia."""
+        try:
+            key = self.stdscr.get_wch()
+        except curses.error:
+            return None
+        if key != "\x1b":
+            return key
+        self.stdscr.timeout(25)
+        try:
+            self.stdscr.get_wch()
+        except curses.error:
+            return "\x1b"
+        else:
+            while True:
+                try:
+                    self.stdscr.get_wch()
+                except curses.error:
+                    return None
+        finally:
+            self.stdscr.timeout(-1)
+
+    # -- interacción --------------------------------------------------
+    def prompt(self, label: str, initial: str = "") -> str | None:
+        """Una línea de texto en la barra de estado. None si se cancela con Esc."""
+        ed = LineEdit(initial)
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        try:
+            while True:
+                maxy, maxx = self.stdscr.getmaxyx()
+                head = f" {label} "
+                text, curx = ed.view(max(1, maxx - 1 - disp_w(head)))
+                put(self.stdscr, maxy - 1, 0, " " * (maxx - 1), curses.A_REVERSE)
+                put(self.stdscr, maxy - 1, 0, cut(head + text, maxx - 1), curses.A_REVERSE)
+                try:
+                    self.stdscr.move(maxy - 1, min(maxx - 1, disp_w(head) + curx))
+                except curses.error:
+                    pass
+                self.stdscr.refresh()
+                key = self.read_wch()
+                if key is None:
+                    continue
+                action = ed.key(key)
+                if action == "enter":
+                    return ed.text.strip()
+                if action == "esc":
+                    return None
+        finally:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+
+    def search(self) -> None:
+        """Filtro incremental: el tablero se reduce mientras escribes. Esc lo
+        deja como estaba, enter se queda con lo que hay."""
+        before, keep = self.query, (self.current().id if self.current() else None)
+        ed = LineEdit(self.query)
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        try:
+            while True:
+                self.query = ed.text
+                self.apply(keep)
+                self.draw(prompt=("/", ed))
+                key = self.read_wch()
+                if key is None:
+                    continue
+                action = ed.key(key)
+                if action == "enter":
+                    return
+                if action == "esc":
+                    self.query = before
+                    self.apply(keep)
+                    return
+        finally:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+
+    def confirm(self, question: str) -> bool:
+        maxy, maxx = self.stdscr.getmaxyx()
+        line = f" {question} [s/N] "
+        put(self.stdscr, maxy - 1, 0, " " * (maxx - 1), curses.A_REVERSE)
+        put(self.stdscr, maxy - 1, 0, cut(line, maxx - 1), curses.A_REVERSE)
+        self.stdscr.refresh()
+        return self.read_key() in (ord("s"), ord("S"), ord("y"), ord("Y"))
+
+    def edit_file(self, path: Path) -> str:
+        """Suelta el terminal, lanza $EDITOR y lo recupera."""
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or default_editor()
+        try:
+            argv = shlex.split(editor) + [str(path)]
+        except ValueError:
+            return f"$EDITOR mal formado: {editor!r}"
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            subprocess.call(argv)
+            note = ""
+        except OSError as exc:
+            note = f"no se pudo abrir {argv[0]!r}: {exc.strerror}"
+        finally:
+            curses.reset_prog_mode()
+            self.stdscr.redrawwin()
+            self.stdscr.refresh()
+        return note
+
+    # -- pintado ------------------------------------------------------
+    def draw_card(self, y: int, x: int, card: Card, selected: bool) -> None:
+        maxy, maxx = self.stdscr.getmaxyx()
+        w, h = self.card_w, CARD_H
+        if selected:
+            # crece hacia el hueco que la separa de las vecinas, sin comérselas:
+            # una fila y una columna por cada lado que tenga hueco de sobra
+            left, top = (1 if x > 0 else 0), (1 if y > 0 else 0)
+            x, y = x - left, y - top
+            w = min(w + left + 1, maxx - x)
+            h = min(h + top + 1, maxy - 1 - y)
+        attr = attr_for(card, selected)
+        for i in range(h):
+            put(self.stdscr, y + i, x, " " * w, attr)
+
+        edge = attr | (curses.A_BOLD if selected else curses.A_NORMAL)
+        tl, tr, bl, br, hz, vt = ("┏", "┓", "┗", "┛", "━", "┃") if selected else ("┌", "┐", "└", "┘", "─", "│")
+        put(self.stdscr, y, x, tl + hz * (w - 2) + tr, edge)
+        put(self.stdscr, y + h - 1, x, bl + hz * (w - 2) + br, edge)
+        for i in range(1, h - 1):
+            put(self.stdscr, y + i, x, vt, edge)
+            put(self.stdscr, y + i, x + w - 1, vt, edge)
+
+        inner = w - 4
+        if card.pinned:
+            put(self.stdscr, y, x + w - 4, "*", edge)
+        put(self.stdscr, y + 1, x + 2, cut(card.title, inner), attr | curses.A_BOLD)
+
+        body_rows = h - 4
+        lines = self.preview(card)
+        shown = lines[:body_rows]
+        for i in range(body_rows):
+            if i >= len(shown):
+                continue
+            done = (item_parts(shown[i]) or (None,))[0]
+            put(self.stdscr, y + 2 + i, x + 2, cut(bullet(shown[i]), inner),
+                attr | (curses.A_DIM if done else 0))
+        if len(lines) > body_rows:
+            put(self.stdscr, y + h - 3, x + 2, cut("…", inner), attr | curses.A_DIM)
+
+        if card.n_done:
+            count = f"{card.n_done}/{card.n_items} hechos"
+        elif card.n_items:
+            count = f"{card.n_items} ítem{'s' if card.n_items != 1 else ''}"
+        else:
+            count = ""
+        stamp = ago(card.mtime)
+        put(self.stdscr, y + h - 2, x + 2, cut(count, max(0, inner - disp_w(stamp) - 1)),
+            attr | curses.A_DIM)
+        put(self.stdscr, y + h - 2, x + w - 2 - disp_w(stamp), stamp, attr | curses.A_DIM)
+
+    def draw_status(self) -> None:
+        maxy, maxx = self.stdscr.getmaxyx()
+        n, total = len(self.cards), len(self.all)
+        left = f" {n}/{total} tarjetas" if n != total else f" {n} tarjeta{'s' if n != 1 else ''}"
+        bits = []
+        if self.query:
+            bits.append(f"/{self.query}")
+        if self.only_scope:
+            bits.append("aquí")
+        if self.order != ORDERS[0]:
+            bits.append(f"por {self.order}")
+        if self.message:
+            bits.append(self.message)
+        left += (" · " + " · ".join(bits) + " ") if bits else " "
+        keys = "/ buscar · p aquí · s orden · enter abrir · n nueva · q salir "
+        line = left + " " * max(0, maxx - disp_w(left) - disp_w(keys) - 1) + keys
+        put(self.stdscr, maxy - 1, 0, cut(line, maxx - 1), curses.A_REVERSE)
+
+    def draw_prompt(self, label: str, ed: LineEdit) -> None:
+        maxy, maxx = self.stdscr.getmaxyx()
+        head = f" {label} "
+        text, curx = ed.view(max(1, maxx - 1 - disp_w(head)))
+        put(self.stdscr, maxy - 1, 0, " " * (maxx - 1), curses.A_REVERSE)
+        put(self.stdscr, maxy - 1, 0, cut(head + text, maxx - 1), curses.A_REVERSE)
+        try:
+            self.stdscr.move(maxy - 1, min(maxx - 1, disp_w(head) + curx))
+        except curses.error:
+            pass
+
+    def draw_empty(self) -> None:
+        maxy, maxx = self.stdscr.getmaxyx()
+        if self.query or self.only_scope:
+            lines = [
+                "Ningún postit coincide.",
+                "",
+                "Esc quita el filtro · / lo cambia · p alterna el proyecto",
+                f"({len(self.all)} tarjetas en total)",
+            ]
+        else:
+            lines = [
+                "El tablero está vacío.",
+                "",
+                "Pulsa n para crear una tarjeta, o desde el shell:",
+                '    postit add trabajo "llamar a soporte"',
+            ]
+        top = max(0, (maxy - len(lines)) // 2 - 1)
+        for i, line in enumerate(lines):
+            put(self.stdscr, top + i, max(0, (maxx - disp_w(line)) // 2), line,
+                curses.A_DIM if i else curses.A_BOLD)
+
+    def draw(self, prompt: tuple[str, LineEdit] | None = None) -> None:
+        self.stdscr.erase()
+        self.measure()
+        if not self.cards:
+            self.draw_empty()
+        else:
+            self.scroll_into_view()
+            first = self.top * self.cols
+            last = min(len(self.cards), first + self.rows_fit * self.cols)
+            # la seleccionada la última: crece hacia los huecos y va por encima
+            orden = [i for i in range(first, last) if i != self.sel]
+            if first <= self.sel < last:
+                orden.append(self.sel)
+            for idx in orden:
+                rel = idx - first
+                y = (rel // self.cols) * (CARD_H + GAP)
+                x = (rel % self.cols) * (self.card_w + GAP)
+                self.draw_card(y, x, self.cards[idx], idx == self.sel)
+        if prompt is None:
+            self.draw_status()
+        else:
+            self.draw_prompt(*prompt)
+        self.stdscr.noutrefresh()
+        curses.doupdate()
+
+    # -- vista de una tarjeta -----------------------------------------
+    def card_view(self, append: bool = False) -> None:
+        """La tarjeta abierta. Se edita aquí dentro: el ítem en edición se pinta
+        en su sitio con el cursor encima, y solo se escribe al confirmar."""
+        card = self.current()
+        if card is None:
+            return
+        card_id = card.id
+        lines = card.body_lines()
+        items = item_indices(lines)
+        sel = items[0] if items else None
+        top = 0
+        undo: list[tuple[list[str], int | None]] = []
+        message = ""
+        edit: LineEdit | None = None
+        edit_idx: int | None = None
+        pending_new = False        # el ítem en edición aún no existe en disco
+        touched = False            # la sangría cambió: hay que guardar aunque el texto no
+
+        def refresh() -> None:
+            nonlocal lines, items
+            self.reload(card_id)
+            fresh = next((c for c in self.all if c.id == card_id), None)
+            lines = fresh.body_lines() if fresh else []
+            items = item_indices(lines)
+
+        def remember() -> None:
+            undo.append((list(lines), sel))
+            del undo[:-50]
+
+        def start_edit(idx: int) -> None:
+            nonlocal sel, edit, edit_idx, pending_new, touched
+            sel = edit_idx = idx
+            edit = LineEdit(item_text(lines[idx]) or "")
+            pending_new = touched = False
+
+        def start_new(at: int, indent: str = "") -> None:
+            """Mete un ítem vacío y entra a editarlo; en disco todavía no está."""
+            nonlocal lines, items, sel, edit, edit_idx, pending_new, touched
+            at = max(0, min(at, len(lines)))
+            lines = lines[:at] + [f"{indent}- "] + lines[at:]
+            items = item_indices(lines)
+            sel = edit_idx = at
+            edit = LineEdit()
+            pending_new = True
+            touched = False
+
+        def commit() -> int | None:
+            """Guarda la línea en edición y sale del modo. Índice guardado, o
+            None si se quedó vacía (o era el nombre)."""
+            nonlocal lines, items, sel, edit, edit_idx, pending_new, touched
+            at, text = edit_idx, edit.text.strip()
+            edit = edit_idx = None
+            if at == TITLE:
+                if text and text != card.title:
+                    remember()
+                    save(card, lines, title=text)
+                    refresh()
+                return None
+            base = list(lines)
+            if pending_new:
+                del base[at]
+            updated = list(base)
+            if text and pending_new:
+                updated.insert(at, set_item_text(lines[at], text))
+            elif text:
+                updated[at] = set_item_text(updated[at], text)
+            elif not pending_new:
+                del updated[at]
+            changed = updated != base or (touched and text)
+            pending_new = touched = False
+            if changed:
+                undo.append((base, sel))
+                del undo[:-50]
+                save(card, updated)
+                refresh()
+            else:
+                lines = updated          # se cancela el ítem vacío que no llegó a ser
+                items = item_indices(lines)
+            sel = at if text else sel
+            return at if text else None
+
+        def clamp() -> int | None:
+            if not items:
+                return None
+            if sel in items:
+                return sel
+            later = [i for i in items if i >= (sel or 0)]
+            return later[0] if later else items[-1]
+
+        if append:
+            start_new(len(lines))
+
+        while True:
+            card = next((c for c in self.all if c.id == card_id), None)
+            if card is None:
+                return       # borrada por fuera
+            maxy, maxx = self.stdscr.getmaxyx()
+            w = min(maxx - 4, 78)
+            h = min(maxy - 2, 24)
+            if w < 20 or h < 6:
+                return
+            y0, x0 = (maxy - h) // 2, (maxx - w) // 2
+            attr = attr_for(card)
+            sel = clamp()
+
+            for i in range(h):
+                put(self.stdscr, y0 + i, x0, " " * w, attr)
+            put(self.stdscr, y0, x0, "┏" + "━" * (w - 2) + "┓", attr | curses.A_BOLD)
+            put(self.stdscr, y0 + h - 1, x0, "┗" + "━" * (w - 2) + "┛", attr | curses.A_BOLD)
+            for i in range(1, h - 1):
+                put(self.stdscr, y0 + i, x0, "┃", attr | curses.A_BOLD)
+                put(self.stdscr, y0 + i, x0 + w - 1, "┃", attr | curses.A_BOLD)
+
+            inner = w - 6
+            cursor: tuple[int, int] | None = None
+            if edit is not None and edit_idx == TITLE:
+                text, curx = edit.view(inner)
+                put(self.stdscr, y0 + 1, x0 + 3, text, attr | curses.A_BOLD)
+                cursor = (y0 + 1, x0 + 3 + curx)
+            else:
+                head = card.title + ("  *" if card.pinned else "")
+                put(self.stdscr, y0 + 1, x0 + 3, cut(head, inner), attr | curses.A_BOLD)
+
+            rows: list[tuple[str, int, int | None]] = []
+            edit_row, edit_col = None, 0
+            for idx, raw in enumerate(lines):
+                parts = item_parts(raw)
+                if parts is None:
+                    for piece in wrap(raw, inner):
+                        rows.append((piece, attr, None))
+                    continue
+                done, _ = parts
+                if edit is not None and idx == edit_idx:
+                    # la línea en edición no se parte: se desplaza de lado
+                    indent = indent_of(raw)
+                    text, curx = edit.view(max(1, inner - disp_w(indent) - 2))
+                    rows.append((f"{indent}▸ {text}", attr | curses.A_BOLD, idx))
+                    edit_row = len(rows) - 1
+                    edit_col = disp_w(indent) + 2 + curx
+                    continue
+                chosen = idx == sel
+                line_attr = attr | (curses.A_BOLD if chosen else (curses.A_DIM if done else 0))
+                text = bullet(raw, "▸ " if chosen else None)
+                pieces = wrap(text, inner) or [""]
+                rows.append((pieces[0], line_attr, idx))
+                for piece in pieces[1:]:
+                    rows.append(("  " + piece, line_attr, idx))
+
+            view_h = h - 5
+            if sel is not None:
+                first = next((i for i, r in enumerate(rows) if r[2] == sel), 0)
+                last = max((i for i, r in enumerate(rows) if r[2] == sel), default=first)
+                if first < top:
+                    top = first
+                elif last >= top + view_h:
+                    top = last - view_h + 1
+            top = max(0, min(top, max(0, len(rows) - view_h)))
+            for i in range(view_h):
+                if top + i < len(rows):
+                    text, row_attr, _ = rows[top + i]
+                    put(self.stdscr, y0 + 3 + i, x0 + 3, cut(text, inner), row_attr)
+            if edit_row is not None and top <= edit_row < top + view_h:
+                cursor = (y0 + 3 + edit_row - top, x0 + 3 + edit_col)
+
+            if edit is not None:
+                hint = "esc listo · enter otra línea · ↑↓ otro ítem · tab sangra"
+            else:
+                hint = message or ("a añadir · enter editar · x hecho · d borrar · "
+                                   "J K mover · t nombre · q cerrar")
+            put(self.stdscr, y0 + h - 2, x0 + 3, cut(hint, inner), attr | curses.A_DIM)
+            try:
+                curses.curs_set(1 if cursor else 0)
+            except curses.error:
+                pass
+            if cursor:
+                try:
+                    self.stdscr.move(*cursor)
+                except curses.error:
+                    pass
+            self.stdscr.refresh()
+            message = ""
+
+            # -- modo edición: las teclas van a la línea, no al tablero
+            if edit is not None:
+                key = self.read_wch()
+                if key is None:
+                    continue
+                action = edit.key(key)
+                if action == "resize":
+                    top = 0
+                elif action in ("tab", "btab") and edit_idx != TITLE:
+                    lines[edit_idx] = reindent(lines[edit_idx], 2 if action == "tab" else -2)
+                    touched = True
+                elif action in ("up", "down"):
+                    # saltar de ítem guarda el que estabas escribiendo
+                    at = commit()
+                    ref = at if at is not None else (sel or 0)
+                    near = ([i for i in items if i > ref][:1] if action == "down"
+                            else [i for i in items if i < ref][-1:])
+                    if near:
+                        start_edit(near[0])
+                elif action in ("enter", "esc"):
+                    at = commit()
+                    if action == "enter" and at is not None and at < len(lines):
+                        start_new(at + 1, indent_of(lines[at]))
+                continue
+
+            key = self.read_key()
+            if key in (ord("q"), ord("Q"), 27):
+                return
+            elif key in (ord("j"), curses.KEY_DOWN):
+                later = [i for i in items if sel is None or i > sel]
+                sel = later[0] if later else sel
+            elif key in (ord("k"), curses.KEY_UP):
+                earlier = [i for i in items if sel is None or i < sel]
+                sel = earlier[-1] if earlier else sel
+            elif key == ord("g"):
+                sel = items[0] if items else None
+            elif key == ord("G"):
+                sel = items[-1] if items else None
+            elif key == curses.KEY_NPAGE:
+                top += view_h
+            elif key == curses.KEY_PPAGE:
+                top -= view_h
+            elif key == ord("a"):
+                start_new(len(lines))
+            elif key == ord("o") and sel is not None:
+                start_new(sel + 1, indent_of(lines[sel]))
+            elif key == ord("O") and sel is not None:
+                start_new(sel, indent_of(lines[sel]))
+            elif key in (curses.KEY_ENTER, 10, 13, ord("i")) and sel is not None:
+                start_edit(sel)
+            elif key == ord("t"):
+                edit_idx = TITLE
+                edit = LineEdit(card.title)
+            elif key == ord("x") and sel is not None:
+                remember()
+                updated = list(lines)
+                updated[sel] = toggle_done(updated[sel])
+                save(card, updated)
+                refresh()
+            elif key in (ord("J"), ord("K")) and sel is not None:
+                # intercambia con el ítem vecino: el texto suelto se queda donde está
+                pos = items.index(sel) + (1 if key == ord("J") else -1)
+                if 0 <= pos < len(items):
+                    other = items[pos]
+                    remember()
+                    updated = list(lines)
+                    updated[sel], updated[other] = updated[other], updated[sel]
+                    save(card, updated)
+                    refresh()
+                    sel = other
+            elif key == ord("d") and sel is not None:
+                remember()
+                save(card, [l for i, l in enumerate(lines) if i != sel])
+                refresh()
+                message = "borrado · u deshace"
+            elif key == ord("u") and undo:
+                prev, at = undo.pop()
+                save(card, prev)
+                refresh()
+                sel = at
+                message = "deshecho"
+            elif key == ord("e"):
+                message = self.edit_file(card.path)
+                refresh()
+            elif key == curses.KEY_RESIZE:
+                top = 0
+
+    # -- bucle --------------------------------------------------------
+    def move(self, delta: int) -> None:
+        if self.cards:
+            self.sel = max(0, min(len(self.cards) - 1, self.sel + delta))
+
+    def run(self) -> None:
+        init_colors()
+        try:
+            # sin esto, curses se guarda un Esc suelto un segundo entero por si
+            # es el principio de una secuencia; con read_key ese margen sobra
+            curses.set_escdelay(25)
+        except (AttributeError, curses.error):
+            pass
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        while True:
+            self.draw()
+            key = self.read_key()
+            self.message = ""
+            card = self.current()
+            if key == 27 and (self.query or self.only_scope):
+                self.query, self.only_scope = "", False
+                self.apply()
+                self.message = "filtro quitado"
+            elif key in (ord("q"), ord("Q"), 27):
+                return
+            elif key == ord("/"):
+                self.search()
+            elif key == ord("p"):
+                self.only_scope = not self.only_scope
+                self.apply()
+                self.message = ("solo lo de " + (Path(project_root(self.cwd)).name or "/")
+                                if self.only_scope else "todas las tarjetas")
+            elif key == ord("s"):
+                self.order = ORDERS[(ORDERS.index(self.order) + 1) % len(ORDERS)]
+                self.apply()
+                self.message = f"orden: {self.order}"
+            elif key in (ord("h"), curses.KEY_LEFT):
+                self.move(-1)
+            elif key in (ord("l"), curses.KEY_RIGHT):
+                self.move(1)
+            elif key in (ord("j"), curses.KEY_DOWN):
+                self.move(self.cols)
+            elif key in (ord("k"), curses.KEY_UP):
+                self.move(-self.cols)
+            elif key == ord("g"):
+                self.sel = 0
+            elif key == ord("G"):
+                self.sel = max(0, len(self.cards) - 1)
+            elif key in (curses.KEY_ENTER, 10, 13) and card:
+                self.card_view()
+            elif key == ord("n"):
+                name = self.prompt("nueva tarjeta:")
+                if name:
+                    # contra todas, no contra las que se ven: si el filtro esconde
+                    # una tarjeta con ese nombre, crearla la machacaría
+                    if find_card(self.all, name) is not None:
+                        self.message = f"{slug(name)} ya existe"
+                    else:
+                        write_card(card_path(name), {
+                            "color": DEFAULT_COLOR, "pinned": False,
+                            "created": datetime.now().strftime("%Y-%m-%dT%H:%M"),
+                            "scope": os.getcwd(),
+                        }, name, [])
+                        self.query = ""      # o nacería escondida detrás del filtro
+                        self.reload(slug(name))
+                        if self.current() and self.current().id == slug(name):
+                            self.card_view(append=True)
+            elif key == ord("a") and card:
+                self.card_view(append=True)
+            elif key == ord("e") and card:
+                self.message = self.edit_file(card.path)
+                self.reload(card.id)
+            elif key == ord("c") and card:
+                names = list(COLORS)
+                nxt = names[(names.index(card.color) + 1) % len(names)]
+                save(card, card.body_lines(), color=nxt)
+                self.reload(card.id)
+            elif key == ord(" ") and card:
+                save(card, card.body_lines(), pinned=not card.pinned)
+                self.reload(card.id)
+            elif key == ord("d") and card:
+                if self.confirm(f"borrar {card.id} ({card.n_items} ítems)?"):
+                    card.path.unlink(missing_ok=True)
+                    self.reload()
+                    self.message = "tarjeta borrada"
+            elif key in (ord("r"), ord("R")):
+                self.reload()
+                self.message = "recargado"
+            elif key == curses.KEY_RESIZE:
+                self.top = 0
+
+
+def cmd_board(_args) -> int:
+    locale.setlocale(locale.LC_ALL, "")
+    curses.wrapper(lambda scr: Board(scr).run())
+    return 0
+
+# ---------------------------------------------------------------- CLI
+
+def die(msg: str) -> None:
+    print(f"postit: {msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def _flag_color(args) -> str | None:
+    if args.color is None:
+        return None
+    if args.color not in COLORS:
+        die(f"color desconocido {args.color!r}; hay: {', '.join(COLORS)}")
+    return args.color
+
+
+def _flag_pinned(args) -> bool | None:
+    if getattr(args, "pin", False):
+        return True
+    if getattr(args, "unpin", False):
+        return False
+    return None
+
+
+def cmd_add(args) -> int:
+    text = " ".join(args.text).strip()
+    if not text and not sys.stdin.isatty():
+        text = sys.stdin.read()
+    new_items = [l.strip() for l in text.splitlines() if l.strip()]
+    if not new_items:
+        die("no hay nada que añadir: pasa el texto como argumento o por stdin")
+
+    card = find_card(load_cards(), args.card)
+    if card is None:
+        meta = {
+            "color": _flag_color(args) or DEFAULT_COLOR,
+            "pinned": bool(_flag_pinned(args)),
+            "created": datetime.now().strftime("%Y-%m-%dT%H:%M"),
+            "scope": args.scope or os.getcwd(),
+        }
+        write_card(card_path(args.card), meta, args.card.strip(),
+                   [f"- {i}" for i in new_items])
+        print(f"{slug(args.card)}: tarjeta creada con {len(new_items)} ítem"
+              f"{'s' if len(new_items) != 1 else ''}")
+        return 0
+
+    lines = card.body_lines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    lines.extend(f"- {i}" for i in new_items)
+    save(card, lines, color=_flag_color(args), pinned=_flag_pinned(args),
+         scope=args.scope)
+    print(f"{card.id}: +{len(new_items)} ítem{'s' if len(new_items) != 1 else ''}"
+          f" ({card.n_items + len(new_items)} en total)")
+    return 0
+
+
+def cmd_new(args) -> int:
+    if find_card(load_cards(), args.card) is not None:
+        die(f"la tarjeta {slug(args.card)!r} ya existe")
+    meta = {
+        "color": _flag_color(args) or DEFAULT_COLOR,
+        "pinned": bool(_flag_pinned(args)),
+        "created": datetime.now().strftime("%Y-%m-%dT%H:%M"),
+        "scope": args.scope or os.getcwd(),
+    }
+    write_card(card_path(args.card), meta, args.card.strip(), [])
+    print(slug(args.card))
+    return 0
+
+
+def cmd_set(args) -> int:
+    card = require_card(args.card)
+    color, pinned = _flag_color(args), _flag_pinned(args)
+    if color is None and pinned is None:
+        die("nada que cambiar: usa --color, --pin o --unpin")
+    save(card, card.body_lines(), color=color, pinned=pinned)
+    print(f"{card.id}: actualizada")
+    return 0
+
+
+def cmd_ls(args) -> int:
+    cards = load_cards()
+    if args.card:
+        card = require_card(args.card)
+        lines = card.body_lines()
+        if args.json:
+            items = []
+            for line in lines:
+                parts = item_parts(line)
+                if parts is not None:
+                    items.append({"done": bool(parts[0]), "text": parts[1]})
+            print(json.dumps({"id": card.id, "title": card.title, "items": items},
+                             ensure_ascii=False, indent=2))
+            return 0
+        print(card.title)
+        n = 0
+        for line in lines:
+            parts = item_parts(line)
+            if parts is None:
+                print(f"      {line}")
+            else:
+                n += 1
+                print(f"{n:>4}. {indent_of(line)}{'✓' if parts[0] else '·'} {parts[1]}")
+        return 0
+
+    if args.here:
+        cards = [c for c in cards if in_scope(c, os.getcwd())]
+    cards = sort_cards(cards, args.sort)
+    if args.json:
+        print(json.dumps([
+            {"id": c.id, "title": c.title, "color": c.color, "pinned": c.pinned,
+             "items": c.n_items, "created": c.created, "scope": c.scope,
+             "mtime": c.mtime, "path": str(c.path)} for c in cards
+        ], ensure_ascii=False, indent=2))
+        return 0
+    if not cards:
+        print("(sin tarjetas aquí)" if args.here else "(sin tarjetas)")
+        return 0
+    width = max(len(c.id) for c in cards)
+    for card in cards:
+        mark = "*" if card.pinned else " "
+        unit = "ítem " if card.n_items == 1 else "ítems"
+        print(f"{mark} {card.id:<{width}}  {card.color:<9} {card.n_items:>3} {unit}  {card.title}")
+    return 0
+
+
+def cmd_find(args) -> int:
+    """Busca en nombres e ítems. Los números son los mismos que en `ls`."""
+    query = " ".join(args.text)
+    words = fold(query).split()
+    cards = [c for c in load_cards() if matches(c, query)]
+    if args.here:
+        cards = [c for c in cards if in_scope(c, os.getcwd())]
+    cards = sort_cards(cards, args.sort)
+
+    def hits(card):
+        out, n = [], 0
+        for line in body_of(card):
+            parts = item_parts(line)
+            if parts is None:
+                continue
+            n += 1
+            if line_matches(line, words):
+                out.append((n, line, parts))
+        return out
+
+    if args.json:
+        print(json.dumps([
+            {"id": c.id, "title": c.title,
+             "items": [{"n": n, "done": bool(pt[0]), "text": pt[1]} for n, _, pt in hits(c)]}
+            for c in cards], ensure_ascii=False, indent=2))
+        return 0
+    if not cards:
+        print("(nada)")
+        return 1
+    for card in cards:
+        print(card.title)
+        for n, line, parts in hits(card):
+            print(f"{n:>4}. {indent_of(line)}{'✓' if parts[0] else '·'} {parts[1]}")
+    return 0
+
+
+def cmd_show(args) -> int:
+    card = require_card(args.card)
+    if args.raw:
+        sys.stdout.write(_read(card.path))
+    else:
+        meta, body = card.read()
+        print(body)
+    return 0
+
+
+def cmd_rm(args) -> int:
+    card = require_card(args.card)
+    lines = card.body_lines()
+
+    if not args.item:
+        if not args.force:
+            answer = input(f"borrar la tarjeta {card.id} ({card.n_items} ítems)? [s/N] ")
+            if answer.strip().lower() not in ("s", "si", "sí", "y", "yes"):
+                print("cancelado")
+                return 1
+        card.path.unlink()
+        print(f"borrada {card.id}")
+        return 0
+
+    positions = [i for i, l in enumerate(lines) if item_text(l) is not None]
+    drop = set()
+    for raw in args.item:
+        try:
+            n = int(raw)
+        except ValueError:
+            die(f"{raw!r} no es un número de ítem")
+        if not 1 <= n <= len(positions):
+            die(f"la tarjeta {card.id} no tiene un ítem {n} (hay {len(positions)})")
+        drop.add(positions[n - 1])
+    save(card, [l for i, l in enumerate(lines) if i not in drop])
+    print(f"{card.id}: -{len(drop)} ítem{'s' if len(drop) != 1 else ''}")
+    return 0
+
+
+def cmd_done(args) -> int:
+    card = require_card(args.card)
+    lines = card.body_lines()
+    positions = item_indices(lines)
+    updated = list(lines)
+    for raw in args.item:
+        try:
+            n = int(raw)
+        except ValueError:
+            die(f"{raw!r} no es un número de ítem")
+        if not 1 <= n <= len(positions):
+            die(f"la tarjeta {card.id} no tiene un ítem {n} (hay {len(positions)})")
+        updated[positions[n - 1]] = toggle_done(updated[positions[n - 1]])
+    save(card, updated)
+    done = sum(1 for l in updated if (item_parts(l) or (None,))[0])
+    print(f"{card.id}: {done}/{len(positions)} hechos")
+    return 0
+
+
+# ------------------------------------------------------- plugin de herdr
+
+TOKEN = "notes"          # nombre del token: en el sidebar se pone como $notes
+SOURCE = "postit"        # de quién es el dato, para poder retirarlo luego
+
+
+def herdr_bin() -> str | None:
+    return os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr")
+
+
+def herdr_panes(herdr: str) -> list[dict]:
+    """Los paneles de la sesión. Lista vacía si no hay servidor al otro lado."""
+    try:
+        out = subprocess.run([herdr, "pane", "list"], capture_output=True,
+                             text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    try:
+        data = json.loads(out.stdout)
+    except ValueError:
+        return []
+    panes = data.get("result", data).get("panes")
+    return panes if isinstance(panes, list) else []
+
+
+def pending_label(cards: list[Card], cwd: str) -> str:
+    """Lo que queda por hacer en las tarjetas de ese proyecto. Vacío si nada."""
+    n = sum(c.n_items - c.n_done for c in cards if in_scope(c, cwd))
+    return f"{n} sin hacer" if n > 0 else ""
+
+
+def cmd_sidebar(args) -> int:
+    """Publica en el sidebar de cada panel con agente cuánto queda pendiente en
+    las tarjetas de *su* proyecto. Cada panel ve lo suyo, que es la gracia de
+    que el dato vaya por panel y no sea un número global."""
+    herdr = herdr_bin()
+    if herdr is None:
+        if args.check:
+            print("postit: no encuentro el binario de herdr")
+        return 0 if not args.check else 1
+    panes = herdr_panes(herdr)
+    if args.check:
+        print(f"herdr:      {herdr}")
+        print(f"paneles:    {len(panes)} ({sum(1 for p in panes if p.get('agent'))} con agente)")
+        print(f"notas en:   {NOTES_DIR}")
+    cards = [] if args.clear else load_cards()
+    touched = 0
+    for pane in panes:
+        if not pane.get("agent"):
+            continue          # el sidebar solo pinta filas de agentes
+        pane_id, cwd = pane.get("pane_id"), pane.get("cwd") or ""
+        if not pane_id:
+            continue
+        value = "" if args.clear else pending_label(cards, cwd)
+        same = (pane.get("tokens") or {}).get(TOKEN, "") == value
+        if args.check:
+            estado = "=" if same else "→"
+            print(f"  {pane_id}  {project_root(cwd)}  {estado}  {value or '(nada)'}")
+        if same:
+            continue          # ya está puesto: ni una llamada de más
+        argv = [herdr, "pane", "report-metadata", pane_id, "--source", SOURCE]
+        argv += ["--token", f"{TOKEN}={value}"] if value else ["--clear-token", TOKEN]
+        try:
+            subprocess.run(argv, capture_output=True, timeout=5)
+            touched += 1
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if args.check:
+        print(f"actualizados: {touched}")
+    return 0
+
+
+def cmd_path(args) -> int:
+    print(require_card(args.card).path if args.card else NOTES_DIR)
+    return 0
+
+
+def cmd_migrate(args) -> int:
+    """Junta las notas del formato viejo (una nota por fichero, con `tags:`) en
+    tarjetas por tag. Los originales se mueven a notes/.migrado/, no se borran."""
+    NOTES_DIR.mkdir(parents=True, exist_ok=True)
+    old = []
+    with os.scandir(NOTES_DIR) as it:
+        for entry in it:
+            if not (entry.is_file() and entry.name.endswith(".md")):
+                continue
+            meta, body = parse_front(_read(Path(entry.path)))
+            if "tags" in meta:
+                old.append((Path(entry.path), meta, body.strip("\n")))
+    if not old:
+        print("no hay notas del formato viejo")
+        return 0
+
+    groups: dict[str, list] = {}
+    for path, meta, body in old:
+        tags = meta.get("tags") or ["sueltas"]
+        if isinstance(tags, str):
+            tags = [tags]
+        groups.setdefault(str(tags[0]), []).append((path, meta, body))
+
+    if not args.force:
+        for name, notes in groups.items():
+            print(f"{slug(name)}: {len(notes)} nota{'s' if len(notes) != 1 else ''}")
+        print("\nnada escrito todavía; repite con --force para aplicarlo")
+        return 0
+
+    backup = NOTES_DIR / ".migrado"
+    backup.mkdir(exist_ok=True)
+    for name, notes in groups.items():
+        target = find_card(load_cards(), name)
+        lines = target.body_lines() if target else []
+        for path, meta, body in notes:
+            body_lines = body.splitlines()
+            lines.append(f"- {body_lines[0].strip()}" if body_lines else "- (vacía)")
+            lines.extend(f"  {l}" for l in body_lines[1:] if l.strip())
+        first_meta = notes[0][1]
+        if target:
+            save(target, lines)
+        else:
+            write_card(card_path(name), {
+                "color": str(first_meta.get("color") or DEFAULT_COLOR),
+                "pinned": any(bool(m.get("pinned")) for _, m, _ in notes),
+                "created": str(first_meta.get("created") or datetime.now().strftime("%Y-%m-%dT%H:%M")),
+                "scope": str(first_meta.get("scope") or ""),
+            }, name, lines)
+        for path, _, _ in notes:
+            os.replace(path, backup / path.name)
+        print(f"{slug(name)}: {len(notes)} nota{'s' if len(notes) != 1 else ''} migradas")
+    print(f"\noriginales en {backup}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="postit",
+        description="Tablero de postits. Cada tarjeta es una lista que va creciendo. "
+                    "Sin subcomando abre el tablero.",
+    )
+    sub = parser.add_subparsers(dest="cmd")
+
+    def color_flags(p, pin=True):
+        p.add_argument("--color", help=", ".join(COLORS))
+        if pin:
+            p.add_argument("--pin", action="store_true", help="fijar arriba del tablero")
+            p.add_argument("--unpin", action="store_true")
+
+    sub.add_parser("board", help="abrir el tablero (por defecto)").set_defaults(func=cmd_board)
+
+    p = sub.add_parser("add", help="añadir una línea a una tarjeta (la crea si no existe)")
+    p.add_argument("card", help="nombre de la tarjeta")
+    p.add_argument("text", nargs="*", help="texto; si falta se lee de stdin (una línea = un ítem)")
+    color_flags(p)
+    p.add_argument("--scope", help="proyecto al que pertenece (por defecto, el cwd)")
+    p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser("new", help="crear una tarjeta vacía")
+    p.add_argument("card")
+    color_flags(p)
+    p.add_argument("--scope")
+    p.set_defaults(func=cmd_new)
+
+    p = sub.add_parser("set", help="cambiar color o fijado de una tarjeta")
+    p.add_argument("card")
+    color_flags(p)
+    p.set_defaults(func=cmd_set)
+
+    p = sub.add_parser("ls", help="listar tarjetas, o los ítems de una")
+    p.add_argument("card", nargs="?")
+    p.add_argument("--here", action="store_true", help="solo las de este proyecto")
+    p.add_argument("--sort", choices=ORDERS, default=ORDERS[0])
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_ls)
+
+    p = sub.add_parser("find", help="buscar texto en nombres e ítems")
+    p.add_argument("text", nargs="+", help="palabras; salen las tarjetas que las tengan todas")
+    p.add_argument("--here", action="store_true", help="solo las de este proyecto")
+    p.add_argument("--sort", choices=ORDERS, default=ORDERS[0])
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_find)
+
+    p = sub.add_parser("show", help="mostrar una tarjeta entera")
+    p.add_argument("card")
+    p.add_argument("--raw", action="store_true", help="fichero entero, con frontmatter")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("rm", help="borrar una tarjeta, o ítems suyos por número")
+    p.add_argument("card")
+    p.add_argument("item", nargs="*", help="números de ítem (de `postit ls <tarjeta>`)")
+    p.add_argument("-f", "--force", action="store_true")
+    p.set_defaults(func=cmd_rm)
+
+    p = sub.add_parser("done", help="marcar o desmarcar ítems por número")
+    p.add_argument("card")
+    p.add_argument("item", nargs="+", help="números de ítem (de `postit ls <tarjeta>`)")
+    p.set_defaults(func=cmd_done)
+
+    p = sub.add_parser("path", help="ruta de una tarjeta, o del directorio")
+    p.add_argument("card", nargs="?")
+    p.set_defaults(func=cmd_path)
+
+    p = sub.add_parser("sidebar", help="publicar lo pendiente en el sidebar de herdr")
+    p.add_argument("--clear", action="store_true", help="retirar el dato de todos los paneles")
+    p.add_argument("--check", action="store_true", help="contar en voz alta lo que haría")
+    p.set_defaults(func=cmd_sidebar)
+
+    p = sub.add_parser("migrate", help="juntar notas del formato viejo en tarjetas por tag")
+    p.add_argument("-f", "--force", action="store_true", help="aplicarlo (sin esto solo enseña qué haría)")
+    p.set_defaults(func=cmd_migrate)
+
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    args = build_parser().parse_args(argv)
+    if not getattr(args, "func", None):
+        return cmd_board(args)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        raise SystemExit(130)

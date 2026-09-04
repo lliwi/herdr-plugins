@@ -1,0 +1,73 @@
+id = "postit"
+name = "postit"
+version = "0.1.0"
+# report-metadata y las filas configurables del sidebar llegaron en 0.7.4.
+min_herdr_version = "0.7.4"
+description = "Tablero de notas tipo postit en un panel, con lo que queda por hacer del proyecto en el sidebar"
+platforms = ["linux", "macos"]
+
+# El panel de siempre: el tablero en un split. La app es la misma que se usa
+# desde el shell, el plugin solo la abre en el sitio correcto.
+[[panes]]
+id = "board"
+title = "postit"
+placement = "split"
+description = "El tablero de postits"
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/postit"']
+
+# El mismo tablero como popup modal: no toca la distribución de paneles y se
+# cierra al salir con q. Para mirar una nota sin deshacer lo que tengas montado.
+[[panes]]
+id = "popup"
+title = "postit"
+placement = "popup"
+width = "70%"
+height = "70%"
+description = "El tablero en un popup, sin tocar la distribución"
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/postit"']
+
+# Los keybindings solo saben invocar acciones (type = "plugin_action"), no
+# paneles, así que cada forma de abrirlo necesita su acción.
+[[actions]]
+id = "open-board"
+title = "postit: abrir el tablero"
+contexts = ["global"]
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/postit-open" split']
+
+[[actions]]
+id = "open-tab"
+title = "postit: el tablero en una pestaña"
+contexts = ["global"]
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/postit-open" tab']
+
+[[actions]]
+id = "open-popup"
+title = "postit: el tablero en un popup"
+contexts = ["global"]
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/postit-open" popup']
+
+[[actions]]
+id = "refresh"
+title = "postit: recontar lo pendiente en el sidebar"
+contexts = ["global"]
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/postit" sidebar']
+
+[[actions]]
+id = "check"
+title = "postit: comprobar la instalación"
+contexts = ["global"]
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/postit" sidebar --check']
+
+# El contador del sidebar se recalcula cuando cambia el foco o muere un panel
+# (cerrar el tablero pasa el foco a otro sitio, así que también entra por aquí).
+[[events]]
+on = "pane.focused"
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/postit" sidebar']
+
+[[events]]
+on = "pane.exited"
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/postit" sidebar']
+
+[[events]]
+on = "pane.closed"
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/postit" sidebar']
