@@ -68,6 +68,7 @@ En el tablero:
 | `c` | siguiente color |
 | `espacio` | fijar / soltar |
 | `d` | borrar la tarjeta (pregunta) |
+| `u` | deshacer lo último (también recupera una tarjeta borrada) |
 | `r` | recargar del disco |
 | `q` | salir |
 
@@ -84,7 +85,7 @@ Dentro de una tarjeta:
 | `x` | marcar / desmarcar hecho |
 | `J` / `K` | mover el ítem abajo / arriba |
 | `d` | borrar el ítem |
-| `u` | deshacer (borrados, ediciones, movimientos) |
+| `u` | deshacer lo último — la misma pila que la del tablero |
 | `e` | abrir la tarjeta en `$EDITOR` |
 | `q` | cerrar |
 
@@ -244,11 +245,26 @@ Cuatro decisiones que conviene no deshacer sin pensarlo:
   tarjeta con nvim por fuera; el `mtime` siempre dice la verdad.
 - **Las escrituras son atómicas** (fichero temporal + `rename`). Dos tableros
   abiertos a la vez no pueden dejar una tarjeta a medias.
+- **Deshacer guarda ficheros, no operaciones.** Cada acción que escribe apunta
+  antes cómo estaban los ficheros que va a tocar (`None` = todavía no existía),
+  y `u` los devuelve a ese estado. Por eso crear, borrar, renombrar, fijar,
+  cambiar el color y editar ítems se deshacen con el mismo código, y por eso `d`
+  en el tablero ya no es definitivo. La pila es una sola, vive en el tablero y
+  guarda 50 pasos; cerrar una tarjeta con `q` ya no la pierde. Lo que no cubre
+  es lo que cambies por fuera: si editas con nvim en otra ventana entre la
+  acción y el `u`, deshacer pisa esos cambios.
 - **Un `Esc` suelto no es un `Esc` del usuario.** Un panel recibe secuencias que
   curses no reconoce (respuestas a consultas del terminal, eventos de foco) y
   todas empiezan por `Esc`. `read_key` mira si detrás viene algo más antes de
   creérselo; sin eso, el tablero se cerraba solo a los dos segundos de abrirlo
   dentro de herdr.
+- **El ítem que estás escribiendo se parte igual que el que estás leyendo.**
+  Antes se desplazaba de lado y perdías de vista el principio de la frase. El
+  wrap de lectura (`wrap`) no vale aquí porque `textwrap` descarta espacios y
+  entonces no se puede saber en qué fila y columna cae el cursor; `wrap_ranges`
+  devuelve rangos que cubren el texto entero, espacios incluidos, y de ahí sale
+  la posición exacta. El nombre de la tarjeta (`t`) sí se sigue desplazando de
+  lado: ocupa una fila fija de la cabecera y partirlo movería todo lo demás.
 - **El cuerpo es texto libre.** Las líneas que empiezan por `-` cuentan como
   ítems, se numeran para `rm` y `done` y son las que se seleccionan en la TUI;
   pero si editas la tarjeta con nvim y escribes un párrafo suelto, se conserva y

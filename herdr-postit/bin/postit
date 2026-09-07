@@ -463,16 +463,20 @@ def card_path(name: str) -> Path:
     return NOTES_DIR / f"{slug(name)}.md"
 
 
-def write_card(path: Path, meta: dict, title: str, lines: list[str]) -> None:
+def write_text_atomic(path: Path, text: str) -> None:
     """Escritura atómica: tmp en el mismo directorio y rename."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def write_card(path: Path, meta: dict, title: str, lines: list[str]) -> None:
     text = dump_front(meta) + title.strip() + "\n"
     body = "\n".join(lines).strip("\n")
     if body:
         text += "\n" + body + "\n"
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    write_text_atomic(path, text)
 
 
 def save(card: Card, lines: list[str], *, title: str | None = None, **changes) -> None:
@@ -486,6 +490,40 @@ def save(card: Card, lines: list[str], *, title: str | None = None, **changes) -
     if title is None:
         title = body.splitlines()[0] if body else card.title
     write_card(card.path, meta, title, lines)
+
+# ---------------------------------------------------------------- deshacer
+
+UNDO_DEPTH = 50
+
+
+@dataclass
+class Undo:
+    """Deshacer se reduce a devolver unos ficheros a como estaban. `None` como
+    contenido significa que la tarjeta no existía todavía: deshacer la borra.
+    Así crear, borrar, renombrar, fijar y editar caben en el mismo mecanismo,
+    sin que cada operación tenga que saber cómo se revierte."""
+    label: str
+    files: list
+    sel: int | None = None     # el ítem donde estaba el cursor, si venía de la tarjeta
+
+
+def snapshot_files(paths) -> list:
+    out = []
+    for path in paths:
+        try:
+            out.append((path, _read(path)))
+        except OSError:
+            out.append((path, None))
+    return out
+
+
+def restore_files(files) -> None:
+    for path, text in files:
+        if text is None:
+            path.unlink(missing_ok=True)
+        else:
+            write_text_atomic(path, text)
+
 
 # ---------------------------------------------------------------- formato
 
@@ -536,6 +574,35 @@ def wrap(text: str, width: int) -> list[str]:
         else:
             lines.extend(textwrap.wrap(para, width) or [""])
     return lines
+
+
+def wrap_ranges(cells: list[str], width: int) -> list[tuple[int, int]]:
+    """Reparte una lista de caracteres en filas de `width` columnas, partiendo
+    por palabras. Devuelve rangos [inicio, fin) que la cubren entera: al revés
+    que `wrap`, aquí no se pierde ni un espacio, y por eso se puede traducir la
+    posición del cursor a fila y columna. Es lo que necesita la línea en
+    edición; para pintar texto ya escrito basta con `wrap`."""
+    width = max(1, width)
+    rows: list[tuple[int, int]] = []
+    start = 0
+    while start < len(cells):
+        col, brk, i = 0, -1, start
+        while i < len(cells):
+            w = _char_w(cells[i])
+            if col + w > width:
+                break
+            col += w
+            i += 1
+            if cells[i - 1].isspace():
+                brk = i          # se puede partir justo detrás del espacio
+        if i >= len(cells):
+            break                # lo que queda cabe entero en la última fila
+        # sin espacio donde partir (una palabra más larga que la fila), se corta
+        end = brk if brk > start else max(i, start + 1)
+        rows.append((start, end))
+        start = end
+    rows.append((start, len(cells)))
+    return rows
 
 
 def bullet(line: str, mark: str | None = None) -> str:
@@ -652,6 +719,20 @@ class LineEdit:
             self.scroll = curx - width + 1
         return cols_slice(self.text, self.scroll, width), curx - self.scroll
 
+    def wrapped(self, width: int) -> tuple[list[str], int, int]:
+        """El texto repartido en filas de `width` columnas, y en qué fila y
+        columna de esas cae el cursor."""
+        width = max(1, width)
+        ranges = wrap_ranges(self.buf, width)
+        texts = ["".join(self.buf[a:b]) for a, b in ranges]
+        row = next((r for r, (a, b) in enumerate(ranges) if a <= self.cur < b),
+                   len(ranges) - 1)
+        col = disp_w("".join(self.buf[ranges[row][0]:self.cur]))
+        if col >= width:
+            texts.append("")     # el cursor cae justo detrás del borde: una fila más
+            row, col = len(texts) - 1, 0
+        return texts, row, col
+
     def key(self, key) -> str:
         """Aplica una tecla. Devuelve qué hacer: ok, enter, esc, tab, btab,
         resize, up, down o nada."""
@@ -740,11 +821,24 @@ class Board:
         self.card_w = TARGET_W
         self.rows_fit = 1
         self.message = ""
+        self.undo: list[Undo] = []
         self.apply()
 
     # -- estado -------------------------------------------------------
     def current(self) -> Card | None:
         return self.cards[self.sel] if self.cards else None
+
+    def remember(self, label: str, *paths: Path, sel: int | None = None) -> None:
+        """Guarda cómo están esos ficheros ahora, antes de tocarlos."""
+        self.undo.append(Undo(label, snapshot_files(paths), sel))
+        del self.undo[:-UNDO_DEPTH]
+
+    def undo_last(self) -> Undo | None:
+        if not self.undo:
+            return None
+        entry = self.undo.pop()
+        restore_files(entry.files)
+        return entry
 
     def reload(self, keep: str | None = None) -> None:
         keep = keep or (self.current().id if self.current() else None)
@@ -1062,11 +1156,11 @@ class Board:
         if card is None:
             return
         card_id = card.id
+        path = card.path
         lines = card.body_lines()
         items = item_indices(lines)
         sel = items[0] if items else None
         top = 0
-        undo: list[tuple[list[str], int | None]] = []
         message = ""
         edit: LineEdit | None = None
         edit_idx: int | None = None
@@ -1080,9 +1174,8 @@ class Board:
             lines = fresh.body_lines() if fresh else []
             items = item_indices(lines)
 
-        def remember() -> None:
-            undo.append((list(lines), sel))
-            del undo[:-50]
+        def remember(label: str) -> None:
+            self.remember(label, path, sel=sel)
 
         def start_edit(idx: int) -> None:
             nonlocal sel, edit, edit_idx, pending_new, touched
@@ -1109,7 +1202,7 @@ class Board:
             edit = edit_idx = None
             if at == TITLE:
                 if text and text != card.title:
-                    remember()
+                    remember("renombrar")
                     save(card, lines, title=text)
                     refresh()
                 return None
@@ -1126,8 +1219,7 @@ class Board:
             changed = updated != base or (touched and text)
             pending_new = touched = False
             if changed:
-                undo.append((base, sel))
-                del undo[:-50]
+                remember("editar")
                 save(card, updated)
                 refresh()
             else:
@@ -1188,12 +1280,16 @@ class Board:
                     continue
                 done, _ = parts
                 if edit is not None and idx == edit_idx:
-                    # la línea en edición no se parte: se desplaza de lado
+                    # se parte por palabras como en lectura; la continuación cae
+                    # bajo el texto, no bajo el ▸, para que se lea como un bloque
                     indent = indent_of(raw)
-                    text, curx = edit.view(max(1, inner - disp_w(indent) - 2))
-                    rows.append((f"{indent}▸ {text}", attr | curses.A_BOLD, idx))
-                    edit_row = len(rows) - 1
-                    edit_col = disp_w(indent) + 2 + curx
+                    pad = disp_w(indent) + 2
+                    pieces, cur_row, cur_col = edit.wrapped(max(1, inner - pad))
+                    for n, piece in enumerate(pieces):
+                        head = f"{indent}▸ " if n == 0 else " " * pad
+                        rows.append((head + piece, attr | curses.A_BOLD, idx))
+                    edit_row = len(rows) - len(pieces) + cur_row
+                    edit_col = pad + cur_col
                     continue
                 chosen = idx == sel
                 line_attr = attr | (curses.A_BOLD if chosen else (curses.A_DIM if done else 0))
@@ -1211,6 +1307,11 @@ class Board:
                     top = first
                 elif last >= top + view_h:
                     top = last - view_h + 1
+            if edit_row is not None:
+                if edit_row < top:
+                    top = edit_row
+                elif edit_row >= top + view_h:
+                    top = edit_row - view_h + 1
             top = max(0, min(top, max(0, len(rows) - view_h)))
             for i in range(view_h):
                 if top + i < len(rows):
@@ -1291,7 +1392,7 @@ class Board:
                 edit_idx = TITLE
                 edit = LineEdit(card.title)
             elif key == ord("x") and sel is not None:
-                remember()
+                remember("marcar")
                 updated = list(lines)
                 updated[sel] = toggle_done(updated[sel])
                 save(card, updated)
@@ -1301,24 +1402,28 @@ class Board:
                 pos = items.index(sel) + (1 if key == ord("J") else -1)
                 if 0 <= pos < len(items):
                     other = items[pos]
-                    remember()
+                    remember("mover")
                     updated = list(lines)
                     updated[sel], updated[other] = updated[other], updated[sel]
                     save(card, updated)
                     refresh()
                     sel = other
             elif key == ord("d") and sel is not None:
-                remember()
+                remember("borrar ítem")
                 save(card, [l for i, l in enumerate(lines) if i != sel])
                 refresh()
                 message = "borrado · u deshace"
-            elif key == ord("u") and undo:
-                prev, at = undo.pop()
-                save(card, prev)
-                refresh()
-                sel = at
-                message = "deshecho"
+            elif key == ord("u"):
+                entry = self.undo_last()
+                if entry is None:
+                    message = "nada que deshacer"
+                else:
+                    refresh()
+                    if entry.sel is not None:
+                        sel = entry.sel
+                    message = f"deshecho: {entry.label}"
             elif key == ord("e"):
+                remember("editar fuera")
                 message = self.edit_file(card.path)
                 refresh()
             elif key == curses.KEY_RESIZE:
@@ -1385,6 +1490,7 @@ class Board:
                     if find_card(self.all, name) is not None:
                         self.message = f"{slug(name)} ya existe"
                     else:
+                        self.remember(f"crear {slug(name)}", card_path(name))
                         write_card(card_path(name), {
                             "color": DEFAULT_COLOR, "pinned": False,
                             "created": datetime.now().strftime("%Y-%m-%dT%H:%M"),
@@ -1397,21 +1503,34 @@ class Board:
             elif key == ord("a") and card:
                 self.card_view(append=True)
             elif key == ord("e") and card:
+                self.remember("editar fuera", card.path)
                 self.message = self.edit_file(card.path)
                 self.reload(card.id)
             elif key == ord("c") and card:
                 names = list(COLORS)
                 nxt = names[(names.index(card.color) + 1) % len(names)]
+                self.remember("color", card.path)
                 save(card, card.body_lines(), color=nxt)
                 self.reload(card.id)
             elif key == ord(" ") and card:
+                self.remember("fijar", card.path)
                 save(card, card.body_lines(), pinned=not card.pinned)
                 self.reload(card.id)
             elif key == ord("d") and card:
                 if self.confirm(f"borrar {card.id} ({card.n_items} ítems)?"):
+                    self.remember(f"borrar {card.id}", card.path)
                     card.path.unlink(missing_ok=True)
                     self.reload()
-                    self.message = "tarjeta borrada"
+                    self.message = "tarjeta borrada · u la recupera"
+            elif key == ord("u"):
+                entry = self.undo_last()
+                if entry is None:
+                    self.message = "nada que deshacer"
+                else:
+                    # el filtro puede esconder justo lo que acabas de recuperar
+                    back = entry.files[0][0].stem if entry.files else None
+                    self.reload(back)
+                    self.message = f"deshecho: {entry.label}"
             elif key in (ord("r"), ord("R")):
                 self.reload()
                 self.message = "recargado"
