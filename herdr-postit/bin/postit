@@ -1087,7 +1087,16 @@ class Board:
         if self.message:
             bits.append(self.message)
         left += (" · " + " · ".join(bits) + " ") if bits else " "
-        keys = "/ buscar · p aquí · s orden · enter abrir · n nueva · q salir "
+        # Se pintan en este orden, pero cuando el ancho no da para todas se
+        # sueltan por el número de al lado, de menor a mayor (a igualdad, la de
+        # más a la derecha). q salir no se suelta nunca: sin ella no se sale.
+        hints = [("/ buscar", 3), ("p aquí", 2), ("enter abrir", 5),
+                 ("n nueva", 4), ("d borrar", 4), ("s orden", 1),
+                 ("u deshacer", 1)]
+        avail = maxx - 1 - disp_w(left)
+        while hints and disp_w(" · ".join([h for h, _ in hints] + ["q salir"])) + 1 > avail:
+            hints.pop(min(range(len(hints)), key=lambda i: (hints[i][1], -i)))
+        keys = " · ".join([h for h, _ in hints] + ["q salir"]) + " "
         line = left + " " * max(0, maxx - disp_w(left) - disp_w(keys) - 1) + keys
         put(self.stdscr, maxy - 1, 0, cut(line, maxx - 1), curses.A_REVERSE)
 

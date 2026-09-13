@@ -1,0 +1,65 @@
+id = "claw"
+name = "OpenClaw (claw)"
+version = "0.1.0"
+# Los paneles de plugin con placement/popup y `plugin pane open` son de 0.7.0.
+min_herdr_version = "0.7.0"
+description = "Cliente TUI de OpenClaw: habla con el gateway por websocket, sin ssh ni navegador"
+platforms = ["linux", "macos"]
+
+# El panel de siempre: el chat en un split, sobre la sesión por defecto (la que
+# el navegador abre en /chat/main). Cerrar el panel no toca la sesión: vive en
+# el servidor, así que al reabrirlo sigue el historial donde estaba.
+[[panes]]
+id = "chat"
+title = "claw"
+placement = "split"
+description = "El chat de OpenClaw"
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/claw"']
+
+# El mismo chat en un popup modal: mirar en qué anda el agente sin deshacer la
+# distribución de paneles que tengas montada.
+[[panes]]
+id = "popup"
+title = "claw"
+placement = "popup"
+width = "80%"
+height = "80%"
+description = "El chat en un popup, sin tocar la distribución"
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/claw"']
+
+# Los keybindings solo saben invocar acciones (type = "plugin_action"), no
+# paneles, así que cada forma de abrirlo necesita su acción.
+[[actions]]
+id = "open-chat"
+title = "claw: abrir el chat"
+contexts = ["global"]
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/claw-open" split']
+
+[[actions]]
+id = "open-tab"
+title = "claw: el chat en una pestaña"
+contexts = ["global"]
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/claw-open" tab']
+
+[[actions]]
+id = "open-popup"
+title = "claw: el chat en un popup"
+contexts = ["global"]
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/claw-open" popup']
+
+# Diagnóstico: resuelve la configuración, conecta, firma el handshake y cuenta
+# qué contesta el gateway. Es lo primero que hay que mirar cuando el panel se
+# cierra solo.
+[[actions]]
+id = "check"
+title = "claw: comprobar la conexión"
+contexts = ["global"]
+command = ["sh", "-c", '"$HERDR_PLUGIN_ROOT/bin/claw" --check']
+
+# Enseña el id de este dispositivo y deja la solicitud de emparejamiento puesta,
+# para aprobarla en Control UI → Settings → Devices.
+[[actions]]
+id = "pair"
+title = "claw: emparejar este dispositivo"
+contexts = ["global"]
+command = ["sh", "-c", '"$HERDR_PLUGIN_ROOT/bin/claw" --pair']

@@ -6,6 +6,12 @@ set -eu
 HERDR="${HERDR_BIN_PATH:-herdr}"
 mode="${1:-split}"
 TAB_NAME="${POSTIT_TAB_NAME:-herdr-postit}"
+ROOT="${HERDR_PLUGIN_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}"
+
+# Las pestañas se listan por workspace; si el contexto no lo trae, que herdr
+# resuelva el que tenga enfocado.
+WS=""
+[ -n "${HERDR_WORKSPACE_ID:-}" ] && WS="--workspace $HERDR_WORKSPACE_ID"
 
 # El contexto llega como JSON y su forma no está fijada, así que se prueban los
 # sitios donde puede venir el directorio antes de rendirse.
@@ -34,7 +40,7 @@ print(dig("focused_pane_cwd") or dig("focused_pane", "cwd") or dig("pane", "cwd"
 # El nombre que luce ahora mismo una pestaña (con el prefijo [N] que le pone el
 # renombrado automático, si lo lleva).
 tab_label() {
-  "$HERDR" tab list 2>/dev/null | POSTIT_TAB="$1" python3 -c '
+  "$HERDR" tab list $WS 2>/dev/null | POSTIT_TAB="$1" python3 -c '
 import json, os, sys
 want = os.environ["POSTIT_TAB"]
 try:
@@ -48,11 +54,106 @@ for tab in (data.get("result") or data).get("tabs") or []:
 ' 2>/dev/null || true
 }
 
+# La pestaña del tablero, si ya existe. Se busca por nombre porque el id cambia
+# en cada sesión: herdr restaura la pestaña guardada en session.json, pero el
+# programa que tenía dentro no vuelve solo.
+find_tab() {
+  "$HERDR" tab list $WS 2>/dev/null | POSTIT_TAB_NAME="$TAB_NAME" python3 -c '
+import json, os, sys
+want = os.environ["POSTIT_TAB_NAME"]
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+for tab in (data.get("result") or data).get("tabs") or []:
+    if (tab.get("label") or "").endswith(want):
+        print(tab.get("tab_id") or "")
+        break
+' 2>/dev/null || true
+}
+
+# Los paneles de una pestaña, en el orden en que los da herdr.
+panes_of() {
+  "$HERDR" pane list $WS 2>/dev/null | POSTIT_TAB="$1" python3 -c '
+import json, os, sys
+want = os.environ["POSTIT_TAB"]
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+for pane in (data.get("result") or data).get("panes") or []:
+    if pane.get("tab_id") == want and pane.get("pane_id"):
+        print(pane["pane_id"])
+' 2>/dev/null || true
+}
+
+# Qué ocupa un panel: el tablero ya abierto, un shell en su prompt (sirve para
+# relanzarlo ahí mismo), o cualquier otra cosa que no hay que pisar.
+pane_kind() {
+  "$HERDR" pane process-info --pane "$1" 2>/dev/null | python3 -c '
+import json, sys
+SHELLS = {"sh", "bash", "zsh", "fish", "dash", "ksh"}
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+procs = ((data.get("result") or {}).get("process_info") or {}).get("foreground_processes") or []
+if any("bin/postit" in (p.get("cmdline") or "") for p in procs):
+    print("postit")
+else:
+    names = {p.get("name") or "" for p in procs}
+    print("shell" if names and names <= SHELLS else "otro")
+' 2>/dev/null || true
+}
+
+# Lo que se teclea en el shell que quedó huérfano. El cd mantiene la promesa de
+# arrancar apuntando donde estabas, igual que cuando la pestaña se crea nueva.
+relaunch_cmd() {
+  POSTIT_BIN="$ROOT/bin/postit" POSTIT_DIR="$dir" python3 -c '
+import os, shlex
+print("cd %s && exec %s" % (shlex.quote(os.environ["POSTIT_DIR"]),
+                            shlex.quote(os.environ["POSTIT_BIN"])))
+'
+}
+
 case "$mode" in
   popup)
     exec "$HERDR" plugin pane open --plugin postit --entrypoint popup --cwd "$dir"
     ;;
   tab)
+    # Si la pestaña ya está, se aprovecha: abrir otra igual cada vez dejaba el
+    # workspace lleno de pestañas herdr-postit vacías.
+    tab="$(find_tab)"
+    if [ -n "$tab" ]; then
+      spare=""
+      for pane in $(panes_of "$tab"); do
+        case "$(pane_kind "$pane")" in
+          postit)
+            exec "$HERDR" tab focus "$tab"          # ya está abierto: solo ir
+            ;;
+          shell)
+            [ -n "$spare" ] || spare="$pane"
+            ;;
+        esac
+      done
+      if [ -n "$spare" ]; then
+        # La pestaña sobrevivió al cierre de herdr pero el tablero no: se
+        # relanza en el mismo panel, sin crear nada.
+        "$HERDR" pane run "$spare" "$(relaunch_cmd)" >/dev/null 2>&1 || true
+        exec "$HERDR" tab focus "$tab"
+      fi
+      first="$(panes_of "$tab" | head -1)"
+      if [ -n "$first" ]; then
+        # Ocupada con otra cosa: el tablero entra como split dentro de ella, que
+        # sigue siendo mejor que una pestaña duplicada.
+        "$HERDR" plugin pane open --plugin postit --entrypoint board \
+          --placement split --target-pane "$first" --direction right \
+          --cwd "$dir" >/dev/null 2>&1 || true
+        exec "$HERDR" tab focus "$tab"
+      fi
+    fi
+
+    # No había pestaña: la de siempre.
     # La pestaña nace llamándose como el programa que corre dentro (python3).
     out="$("$HERDR" plugin pane open --plugin postit --entrypoint board \
       --placement tab --cwd "$dir")"

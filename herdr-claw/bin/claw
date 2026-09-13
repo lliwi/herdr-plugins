@@ -1,0 +1,1197 @@
+#!/usr/bin/env python3
+"""claw — cliente TUI de OpenClaw para un panel de herdr.
+
+OpenClaw corre en un docker y su chat vive en el navegador (/chat/main). Este
+panel habla directamente con el gateway por websocket: ni ssh ni navegador. La
+conversación es la misma que se ve en la web —las sesiones viven en el
+servidor—, así que cerrar el panel no pierde nada y abrirlo continúa donde se
+quedó, aunque el último mensaje lo hayas escrito desde el móvil.
+
+    claw                 abre el chat de la sesión por defecto
+    claw --session foo   abre esa sesión
+    claw --check         diagnóstico: configuración, handshake y sesiones
+    claw --pair          enseña el id de este dispositivo y deja la solicitud
+    claw --raw           vuelca los eventos del gateway en crudo (depuración)
+
+Configuración en `$(herdr plugin config-dir claw)/.env` (ver config.example.env).
+El entorno manda sobre el fichero.
+
+Teclas dentro del panel:
+
+    Enter        enviar            Ctrl+J   salto de línea en el mensaje
+    Ctrl+O       cambiar de sesión Ctrl+G   sesión nueva
+    PgUp/PgDn    desplazar         Ctrl+L   redibujar
+    Ctrl+C       salir             Ctrl+U   borrar la línea
+
+Solo biblioteca estándar.
+"""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import textwrap
+import time
+import unicodedata
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import gateway as gw  # noqa: E402
+from wsclient import WebSocketClosed, WebSocketError  # noqa: E402
+
+PLUGIN_ID = "claw"
+VERSION = "0.1.0"
+DEFAULT_URL = "http://localhost:18789"
+DEFAULT_SESSION = "main"
+HISTORY_LIMIT = 80
+
+
+# --------------------------------------------------------------------------- #
+# Configuración
+# --------------------------------------------------------------------------- #
+
+def config_dirs() -> list[Path]:
+    """Dónde buscar el .env, del sitio que inyecta herdr al de siempre."""
+    dirs = []
+    injected = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+    if injected:
+        dirs.append(Path(injected))
+    home = Path.home() / ".config/herdr/plugins"
+    dirs.append(home / "config" / PLUGIN_ID)
+    dirs.append(home / PLUGIN_ID)  # ubicación antigua
+    return dirs
+
+
+def load_config() -> dict[str, str]:
+    """Primer .env que exista; el entorno real tiene prioridad."""
+    values: dict[str, str] = {}
+    for directory in config_dirs():
+        path = directory / ".env"
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, raw = line.partition("=")
+            values[key.strip()] = raw.strip().strip("'\"")
+        values["_source"] = str(path)
+        break
+    for key in ("CLAW_URL", "CLAW_TOKEN", "CLAW_SESSION"):
+        if os.environ.get(key):
+            values[key] = os.environ[key]
+    values.setdefault("CLAW_URL", DEFAULT_URL)
+    values.setdefault("CLAW_SESSION", DEFAULT_SESSION)
+    return values
+
+
+# --------------------------------------------------------------------------- #
+# Mensajes
+# --------------------------------------------------------------------------- #
+
+ROLE_LABELS = {
+    "user": "tú",
+    "assistant": "claw",
+    "system": "sistema",
+    "tool": "⚙",
+}
+
+# Cómo llama OpenClaw a cada papel y cómo lo llamamos aquí. `toolResult` es el
+# vuelco de una herramienta: se enseña recortado, que un JSON de mil líneas en
+# medio de la conversación no deja ver nada.
+ROLE_ALIASES = {
+    "user": "user",
+    "assistant": "assistant",
+    "agent": "assistant",
+    "bot": "assistant",
+    "model": "assistant",
+    "system": "system",
+    "tool": "tool",
+    "toolresult": "tool",
+    "toolcall": "tool",
+}
+
+# Lo que se enseña de un resultado de herramienta antes de cortar.
+TOOL_RESULT_CHARS = 400
+
+
+def _text_of(node, depth: int = 0) -> str:
+    """Saca el texto de un mensaje sin casarse con una forma concreta.
+
+    El gateway manda los mensajes con partes (texto, tool calls, adjuntos) y la
+    forma exacta cambia entre versiones de OpenClaw. En vez de fijar el esquema,
+    se recorre lo que llega y se junta todo lo que sea texto: lo que no se
+    entiende se queda fuera en vez de romper el panel.
+    """
+    if depth > 6 or node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, (int, float, bool)):
+        return str(node)
+    if isinstance(node, list):
+        return "\n".join(filter(None, (_text_of(item, depth + 1) for item in node)))
+    if isinstance(node, dict):
+        for key in ("text", "content", "message", "value", "body", "parts", "blocks"):
+            if key in node:
+                found = _text_of(node[key], depth + 1)
+                if found:
+                    return found
+        # Una llamada a herramienta no trae texto: se resume para que se vea
+        # que el agente está haciendo algo y no un hueco en blanco.
+        name = node.get("name") or node.get("tool") or node.get("toolName")
+        if name:
+            return f"⚙ {name}"
+    return ""
+
+
+def _role_of(raw: dict) -> str:
+    for key in ("role", "author", "from", "sender", "kind"):
+        value = raw.get(key)
+        if isinstance(value, dict):
+            value = value.get("role") or value.get("type")
+        if isinstance(value, str) and value:
+            role = ROLE_ALIASES.get(value.lower())
+            if role:
+                return role
+    return "assistant"
+
+
+def _time_of(raw: dict) -> float:
+    for key in ("ts", "createdAt", "timestamp", "time", "at", "createdAtMs"):
+        value = raw.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            return value / 1000 if value > 1e11 else float(value)
+        if isinstance(value, str) and value:
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+    return time.time()
+
+
+class Entry:
+    """Un mensaje en el transcript. `key` es lo que permite actualizarlo."""
+
+    def __init__(self, key: str, role: str, text: str, when: float, pending: bool = False):
+        self.key = key
+        self.role = role
+        self.text = text
+        self.when = when
+        self.pending = pending
+
+    @classmethod
+    def from_raw(cls, raw: dict, fallback_key: str = "") -> "Entry | None":
+        if not isinstance(raw, dict):
+            return None
+        role = _role_of(raw)
+        text = _text_of(raw).strip()
+        if role == "tool":
+            name = raw.get("toolName") or raw.get("name") or ""
+            body = " ".join(text.split())
+            if len(body) > TOOL_RESULT_CHARS:
+                body = body[:TOOL_RESULT_CHARS] + "…"
+            text = f"{name} → {body}".strip(" →") if name else body
+        if not text:
+            return None
+        # OpenClaw guarda varios mensajes bajo el mismo `__openclaw.id` (el
+        # pensamiento, la llamada a la herramienta y el texto de una misma
+        # respuesta), así que el id solo no distingue: se le pega un resumen
+        # del contenido. Mismo id y mismo texto = el mismo mensaje, que es lo
+        # que hace falta para que un reenvío no lo duplique.
+        marker = raw.get("__openclaw") if isinstance(raw.get("__openclaw"), dict) else {}
+        base = str(marker.get("id") or raw.get("id") or raw.get("messageId")
+                   or fallback_key or "msg")
+        digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+        return cls(f"{base}:{digest}", role, text, _time_of(raw))
+
+
+class Transcript:
+    """Lista de mensajes con actualización por clave (los deltas reescriben)."""
+
+    def __init__(self):
+        self.entries: list[Entry] = []
+        self._index: dict[str, int] = {}
+
+    def clear(self) -> None:
+        self.entries.clear()
+        self._index.clear()
+
+    def put(self, entry: Entry) -> bool:
+        """Añade o reemplaza. Devuelve si el transcript ha cambiado."""
+        position = self._index.get(entry.key)
+        if position is not None:
+            current = self.entries[position]
+            if current.text == entry.text and current.role == entry.role:
+                return False
+            self.entries[position] = entry
+            return True
+        self._index[entry.key] = len(self.entries)
+        self.entries.append(entry)
+        return True
+
+    def drop(self, key: str) -> None:
+        position = self._index.pop(key, None)
+        if position is None:
+            return
+        del self.entries[position]
+        self._index = {e.key: i for i, e in enumerate(self.entries)}
+
+    def replace_all(self, entries: list[Entry]) -> None:
+        self.clear()
+        for entry in entries:
+            self.put(entry)
+
+
+# --------------------------------------------------------------------------- #
+# Capa de chat sobre el gateway
+# --------------------------------------------------------------------------- #
+
+class Chat:
+    """Lo que el panel necesita del gateway, con los nombres del protocolo."""
+
+    def __init__(self, gateway: gw.Gateway, session_key: str):
+        self.gateway = gateway
+        self.session_key = session_key
+        self.agent_id: str | None = None
+        self.session_id: str | None = None
+
+    def resolve(self) -> dict | None:
+        """Traduce la clave de la config a la que entiende el gateway.
+
+        Con varios agentes configurados, `main` a secas no vale: el gateway
+        contesta «session key "main" has no explicit owner». La clave buena es
+        la que trae `sessions.list` (`agent:main:main`), y de paso sale el
+        `agentId` que hay que mandar en cada petición.
+        """
+        try:
+            sessions = self.sessions()
+        except gw.GatewayError:
+            return None
+        chosen = next((s for s in sessions
+                       if _same_session(str(s.get("key") or ""), self.session_key)), None)
+        if chosen is None:
+            chosen = next((s for s in sessions if s.get("isMain")), None)
+        if chosen is None:
+            return None
+        self.adopt(chosen)
+        return chosen
+
+    def adopt(self, session: dict) -> None:
+        self.session_key = str(session.get("key") or self.session_key)
+        agent = session.get("agentId")
+        self.agent_id = str(agent) if agent else self.agent_id
+        self.session_id = None
+
+    def history(self, limit: int = HISTORY_LIMIT) -> list[Entry]:
+        params = {"sessionKey": self.session_key, "limit": limit}
+        if self.agent_id:
+            params["agentId"] = self.agent_id
+        payload = self.gateway.request("chat.history", params)
+        self.session_id = payload.get("sessionId") or self.session_id
+        messages = payload.get("messages")
+        entries = []
+        for raw in messages if isinstance(messages, list) else []:
+            entry = Entry.from_raw(raw)
+            if entry:
+                entries.append(entry)
+        entries.sort(key=lambda e: e.when)
+        return entries
+
+    def subscribe(self) -> None:
+        """Sin esto el gateway no manda los session.message de esta sesión.
+
+        Ojo: aquí la clave se llama `key`, no `sessionKey` como en el resto de
+        métodos. El esquema del gateway rechaza `sessionKey` en este.
+        """
+        self.gateway.request("sessions.messages.subscribe", self._subscription())
+
+    def unsubscribe(self) -> None:
+        try:
+            self.gateway.request("sessions.messages.unsubscribe", self._subscription(),
+                                 timeout=5)
+        except (gw.GatewayError, WebSocketError):
+            pass
+
+    def _subscription(self) -> dict:
+        params = {"key": self.session_key}
+        if self.agent_id:
+            params["agentId"] = self.agent_id
+        return params
+
+    def send(self, message: str) -> dict:
+        params = {
+            "sessionKey": self.session_key,
+            "message": message,
+            # El gateway usa esta clave para no duplicar el mensaje si la
+            # petición se reintenta: sin ella un reenvío se convierte en dos.
+            "idempotencyKey": uuid.uuid4().hex,
+        }
+        if self.agent_id:
+            params["agentId"] = self.agent_id
+        return self.gateway.request("chat.send", params, timeout=30)
+
+    def sessions(self) -> list[dict]:
+        payload = self.gateway.request("sessions.list", {})
+        found = payload.get("sessions")
+        return found if isinstance(found, list) else []
+
+    def create_session(self) -> str | None:
+        params = {"agentId": self.agent_id} if self.agent_id else {}
+        payload = self.gateway.request("sessions.create", params)
+        value = payload.get("key")
+        return value if isinstance(value, str) and value else None
+
+    def belongs(self, payload: dict) -> bool:
+        """Si un evento es de la sesión que estamos mirando."""
+        if not isinstance(payload, dict):
+            return False
+        key = payload.get("sessionKey") or payload.get("key")
+        if isinstance(key, str) and key:
+            return _same_session(key, self.session_key)
+        session = payload.get("session")
+        if isinstance(session, dict):
+            key = session.get("key")
+            return isinstance(key, str) and _same_session(key, self.session_key)
+        return False
+
+
+def _same_session(left: str, right: str) -> bool:
+    """`main`, `agent:x:main` y `AGENT:X:MAIN` son la misma sesión."""
+    strip = re.compile(r"^agent:[^:]+:", re.I)
+    return strip.sub("", left).lower() == strip.sub("", right).lower()
+
+
+# --------------------------------------------------------------------------- #
+# Utilidades de pintado
+# --------------------------------------------------------------------------- #
+
+def display_width(text: str) -> int:
+    return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text)
+
+
+def clip(text: str, width: int) -> str:
+    """Corta a lo ancho contando caracteres dobles, que si no curses se queja."""
+    if width <= 0:
+        return ""
+    out, used = [], 0
+    for char in text:
+        step = 2 if unicodedata.east_asian_width(char) in "WF" else 1
+        if used + step > width:
+            break
+        out.append(char)
+        used += step
+    return "".join(out)
+
+
+def wrap(text: str, width: int) -> list[str]:
+    lines: list[str] = []
+    for paragraph in text.splitlines() or [""]:
+        if not paragraph.strip():
+            lines.append("")
+            continue
+        lines.extend(textwrap.wrap(paragraph, max(8, width),
+                                   drop_whitespace=False, replace_whitespace=False)
+                     or [""])
+    return lines
+
+
+# --------------------------------------------------------------------------- #
+# Presencia en la barra de agentes de herdr
+# --------------------------------------------------------------------------- #
+
+class PaneAgent:
+    """Le cuenta a herdr que este panel lleva un agente y en qué anda.
+
+    herdr reconoce a los agentes por el programa que corre en el panel, y aquí
+    el programa es este cliente: sin decir nada, el panel sale en «spaces» y
+    nunca en «agents». La otra salida era disfrazarse —reexec con el argv[0] de
+    otro agente, como hacía el plugin de hermes— y dejar que herdr adivinara el
+    estado leyendo la pantalla. No hace falta: el gateway nos dice de primera
+    mano cuándo el agente trabaja, cuándo espera una aprobación y cuándo acabó,
+    así que se lo reportamos con `herdr pane report-agent`.
+
+    Los avisos van en un proceso aparte y sin esperarlo: una llamada al CLI son
+    decenas de milisegundos, y el bucle del panel no está para esperas.
+    """
+
+    LABEL = "claw"
+
+    def __init__(self):
+        self.pane = os.environ.get("HERDR_PANE_ID") or ""
+        self.herdr = os.environ.get("HERDR_BIN_PATH") or "herdr"
+        self.seq = 0
+        self.last: tuple | None = None
+        self.running: list[subprocess.Popen] = []
+
+    @property
+    def active(self) -> bool:
+        return bool(self.pane)
+
+    def _spawn(self, args: list[str]) -> None:
+        try:
+            self.running.append(subprocess.Popen(
+                args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL))
+        except OSError:
+            self.pane = ""      # sin herdr delante, no se insiste
+
+    def reap(self) -> None:
+        """Recoge los avisos que ya terminaron, para no dejar zombis."""
+        self.running = [p for p in self.running if p.poll() is None]
+
+    def report(self, state: str, message: str = "", session: str = "") -> None:
+        if not self.active:
+            return
+        signature = (state, message, session)
+        if signature == self.last:
+            return                      # herdr ya lo sabe
+        self.last = signature
+        self.seq += 1
+        args = [self.herdr, "pane", "report-agent", self.pane,
+                "--source", self.LABEL, "--agent", self.LABEL,
+                "--state", state, "--seq", str(self.seq)]
+        if message:
+            args += ["--message", message[:120]]
+        if session:
+            args += ["--agent-session-id", session]
+        self._spawn(args)
+
+    def release(self) -> None:
+        """Al salir: el panel deja de ser un agente y no se queda colgado."""
+        if not self.active:
+            return
+        try:
+            subprocess.run([self.herdr, "pane", "release-agent", self.pane,
+                            "--source", self.LABEL, "--agent", self.LABEL],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=3, check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# La TUI
+# --------------------------------------------------------------------------- #
+
+# Lo que espera el panel por una tecla antes de volver a mirar el gateway, y
+# cuántas teclas seguidas atiende antes de repintar.
+KEY_WAIT_MS = 60
+KEYS_PER_FRAME = 64
+
+COLOR_ROLES = {
+    "user": 1,
+    "assistant": 2,
+    "system": 3,
+    "tool": 4,
+}
+
+
+class App:
+    """El panel: transcript arriba, línea de escritura abajo."""
+
+    def __init__(self, screen, chat: Chat, config: dict):
+        self.screen = screen
+        self.chat = chat
+        self.config = config
+        self.transcript = Transcript()
+        self.buffer = ""
+        self.cursor = 0
+        self.scroll = 0          # líneas por encima del fondo; 0 = pegado abajo
+        self.status = ""
+        self.working = False
+        self.connected = True
+        self.sessions: list[dict] = []
+        self.retry_at = 0.0
+        self.headline = ""          # lo que dice session.observer del run en curso
+        self.live: dict[str, str] = {}   # texto del turno que aún se está escribiendo
+        self.last_activity = 0.0
+        self.blocked = False        # el agente espera una aprobación en OpenClaw
+        self.agent = PaneAgent()
+        self.host = gw.http_origin(chat.gateway.base_url).split("//", 1)[-1]
+
+    # ------------------------------------------------------------------ arranque
+
+    def setup_colors(self) -> None:
+        if not curses.has_colors():
+            return
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(COLOR_ROLES["user"], curses.COLOR_CYAN, -1)
+        curses.init_pair(COLOR_ROLES["assistant"], curses.COLOR_GREEN, -1)
+        curses.init_pair(COLOR_ROLES["system"], curses.COLOR_YELLOW, -1)
+        curses.init_pair(COLOR_ROLES["tool"], curses.COLOR_MAGENTA, -1)
+        curses.init_pair(5, curses.COLOR_RED, -1)      # errores
+        curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLUE)  # barras
+
+    def run(self) -> None:
+        curses.curs_set(1)
+        curses.nonl()  # Enter llega como \r y así Ctrl+J queda libre para el salto
+        self.screen.timeout(KEY_WAIT_MS)
+        self.setup_colors()
+        self.reload_history()
+        self.report_state()
+        while True:
+            self.draw()
+            try:
+                self.tick()
+            except KeyboardInterrupt:
+                return
+            if not self.read_keys():
+                return
+
+    # ------------------------------------------------------------------ datos
+
+    def reload_history(self) -> None:
+        try:
+            self.chat.subscribe()
+            self.transcript.replace_all(self.chat.history())
+            self.status = ""
+        except gw.GatewayError as error:
+            self.note(f"no se pudo cargar el historial: {error}", role="system")
+        except (WebSocketError, OSError) as error:
+            self.drop_connection(str(error))
+
+    def note(self, text: str, role: str = "system") -> None:
+        self.transcript.put(Entry(f"nota:{time.time()}:{len(self.transcript.entries)}",
+                                  role, text, time.time()))
+
+    def drop_connection(self, reason: str) -> None:
+        if self.connected:
+            self.note(f"conexión perdida: {reason}", role="system")
+        self.connected = False
+        self.working = False
+        self.retry_at = time.monotonic() + 2.0
+
+    def reconnect(self) -> None:
+        try:
+            self.chat.gateway.close()
+            self.chat.gateway.connect()
+            self.connected = True
+            self.note("reconectado", role="system")
+            self.reload_history()
+        except gw.PairingRequired:
+            self.note("el gateway pide aprobar este dispositivo otra vez", role="system")
+            self.retry_at = time.monotonic() + 10.0
+        except (gw.GatewayError, WebSocketError, OSError) as error:
+            self.status = f"reconectando… ({error})"
+            self.retry_at = time.monotonic() + 5.0
+
+    def tick(self) -> None:
+        """Eventos del gateway y reconexión."""
+        if not self.connected:
+            if time.monotonic() >= self.retry_at:
+                self.reconnect()
+            return
+        try:
+            events = self.chat.gateway.pump()
+        except WebSocketClosed as error:
+            self.drop_connection(error.reason or f"código {error.code}")
+            return
+        except (WebSocketError, OSError) as error:
+            self.drop_connection(str(error))
+            return
+        for event in events:
+            self.apply_event(event)
+        # Una herramienta puede tirarse minutos sin decir nada, pero un run que
+        # lleva dos minutos mudo es que acabó y no nos enteramos del final.
+        if self.working and self.last_activity and \
+                time.monotonic() - self.last_activity > 120:
+            self.working = False
+            self.headline = ""
+        self.report_state()
+
+    def report_state(self) -> None:
+        """El estado del panel, tal y como lo ve la barra de agentes."""
+        self.agent.reap()
+        if not self.connected:
+            state, message = "unknown", "sin conexión con el gateway"
+        elif self.blocked:
+            state, message = "blocked", "esperando una aprobación en OpenClaw"
+        elif self.working:
+            state, message = "working", self.headline or self.status
+        else:
+            state, message = "idle", ""
+        self.agent.report(state, " ".join(message.split()),
+                          self.chat.session_id or "")
+
+    def apply_event(self, event: dict) -> None:
+        name = event.get("event") or ""
+        payload = event.get("payload") or {}
+        if name in ("health", "heartbeat", "tick", "presence", "chat.send_timing"):
+            return
+        if name == "session.message":
+            if not self.chat.belongs(payload):
+                return
+            raw = payload.get("message") if isinstance(payload.get("message"), dict) else payload
+            entry = Entry.from_raw(raw, fallback_key=str(payload.get("runId") or ""))
+            if entry:
+                self.absorb(entry)
+            if entry and entry.role == "assistant":
+                # Lo que se estaba escribiendo en vivo ya está confirmado: el
+                # borrador se retira para no enseñarlo dos veces.
+                self.clear_live()
+                # `toolUse` significa que el turno sigue: llama a una
+                # herramienta y volverá. Cualquier otro final cierra el run.
+                if raw.get("stopReason") not in ("toolUse", None):
+                    self.working = False
+                    self.blocked = False
+                    self.headline = ""
+        elif name == "agent":
+            self.apply_stream(payload)
+        elif name == "session.observer":
+            if self.chat.belongs(payload):
+                self.headline = str(payload.get("headline") or "")
+                self.working = True
+                self.last_activity = time.monotonic()
+        elif name == "sessions.changed":
+            self.sessions = []  # se recarga al abrir el selector
+
+    # Los eventos `agent` son el turno en directo: uno por trozo de texto,
+    # pensamiento, herramienta o cambio de fase. El texto del asistente entra
+    # por `stream = assistant`; el resto alimenta la línea de estado, que si no
+    # el panel se queda mudo durante los minutos que dura una herramienta.
+    def apply_stream(self, payload: dict) -> None:
+        if not self.chat.belongs(payload):
+            return
+        if payload.get("isHeartbeat"):
+            return
+        stream = str(payload.get("stream") or "")
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        self.working = True
+        self.last_activity = time.monotonic()
+
+        if stream == "assistant":
+            run = str(payload.get("runId") or "run")
+            text = data.get("text")
+            if isinstance(text, str) and text:
+                body = text                      # el evento trae el acumulado
+            else:
+                body = self.live.get(run, "") + str(data.get("delta") or "")
+            if not body:
+                return
+            self.live[run] = body
+            self.transcript.put(Entry(f"live:{run}", "assistant", body, time.time(),
+                                      pending=True))
+            self.status = ""
+        elif stream == "thinking":
+            self.status = "pensando…"
+        elif stream in ("item", "tool"):
+            if data.get("kind") == "preamble":
+                self.status = " ".join(str(data.get("progressText") or "").split())[:120]
+                return
+            title = str(data.get("title") or data.get("name") or "")
+            phase = data.get("phase")
+            if phase == "start" and title:
+                self.status = f"⚙ {title}"
+            elif phase == "end":
+                self.status = ""
+        elif stream == "run_status":
+            message = data.get("message")
+            phase = str(data.get("phase") or "")
+            self.status = (" ".join(str(message).split())[:120] if message
+                           else phase.replace("_", " "))
+        elif stream == "lifecycle":
+            phase = data.get("phase")
+            if phase == "waiting-approval":
+                self.blocked = True
+                self.status = "esperando una aprobación en OpenClaw"
+            elif phase == "approval-resolved":
+                self.blocked = False
+                self.status = ""
+        elif stream == "notice":
+            notice = data.get("text") or data.get("message")
+            if notice:
+                self.note(str(notice))
+
+    def clear_live(self) -> None:
+        for run in list(self.live):
+            self.transcript.drop(f"live:{run}")
+        self.live.clear()
+
+    def absorb(self, entry: Entry) -> None:
+        """Mete un mensaje del servidor y retira el eco local si lo hubiera."""
+        if entry.role == "user":
+            for existing in list(self.transcript.entries):
+                if existing.pending and existing.text.strip() == entry.text.strip():
+                    self.transcript.drop(existing.key)
+                    break
+        self.transcript.put(entry)
+
+    # ------------------------------------------------------------------ envío
+
+    def submit(self) -> None:
+        message = self.buffer.strip()
+        if not message:
+            return
+        self.buffer = ""
+        self.cursor = 0
+        self.scroll = 0
+        local = Entry(f"local:{uuid.uuid4().hex}", "user", message, time.time(), pending=True)
+        self.transcript.put(local)
+        if not self.connected:
+            self.note("sin conexión: el mensaje no se ha enviado", role="system")
+            self.transcript.drop(local.key)
+            return
+        try:
+            self.chat.send(message)
+            self.working = True
+            self.last_activity = time.monotonic()
+            self.status = ""
+        except gw.GatewayError as error:
+            self.transcript.drop(local.key)
+            self.note(f"el gateway rechazó el mensaje: {error}", role="system")
+        except (WebSocketError, OSError) as error:
+            self.transcript.drop(local.key)
+            self.drop_connection(str(error))
+
+    # ------------------------------------------------------------------ pintado
+
+    def layout(self) -> tuple[int, int, int]:
+        height, width = self.screen.getmaxyx()
+        input_lines = min(5, max(1, len(wrap(self.buffer or "", max(8, width - 4)))))
+        body = max(1, height - input_lines - 3)
+        return height, width, body
+
+    def rendered(self, width: int) -> list[tuple[str, int]]:
+        """Transcript ya envuelto: (línea, par de color)."""
+        lines: list[tuple[str, int]] = []
+        for entry in self.transcript.entries:
+            color = COLOR_ROLES.get(entry.role, 0)
+            stamp = datetime.fromtimestamp(entry.when).strftime("%H:%M")
+            label = ROLE_LABELS.get(entry.role, entry.role)
+            mark = " ·" if entry.pending else ""
+            lines.append((f"{label} {stamp}{mark}", color))
+            for line in wrap(entry.text, width - 2):
+                lines.append((f"  {line}", 0))
+            lines.append(("", 0))
+        return lines
+
+    def draw(self) -> None:
+        height, width, body = self.layout()
+        self.screen.erase()
+
+        # Barra de arriba: dónde estamos y cómo está la conexión.
+        state = "trabajando…" if self.working else ("conectado" if self.connected
+                                                    else "desconectado")
+        left = f" claw · {self.chat.session_key} · {self.host} "
+        right = f" {state} "
+        bar = left + " " * max(0, width - display_width(left) - display_width(right)) + right
+        self.screen.addstr(0, 0, clip(bar, width),
+                           curses.color_pair(6) if curses.has_colors() else curses.A_REVERSE)
+
+        lines = self.rendered(width)
+        # `scroll` cuenta desde el fondo, así que al llegar mensajes nuevos la
+        # vista se queda donde está en vez de saltar.
+        top = max(0, len(lines) - body - self.scroll)
+        for row, (text, color) in enumerate(lines[top:top + body]):
+            attr = curses.color_pair(color) if color and curses.has_colors() else 0
+            if not text.startswith("  "):
+                attr |= curses.A_BOLD
+            self.screen.addstr(1 + row, 0, clip(text, width - 1), attr)
+
+        self.screen.addstr(body + 1, 0, clip("─" * width, width), curses.A_DIM)
+
+        prompt_width = max(8, width - 3)
+        input_lines = max(1, height - body - 3)
+        prompt_lines = wrap(self.buffer, prompt_width) or [""]
+        cursor_lines = wrap(self.buffer[:self.cursor], prompt_width) or [""]
+        cursor_row = len(cursor_lines) - 1
+        # Se enseña el tramo donde está el cursor, no siempre el principio.
+        first = max(0, cursor_row - input_lines + 1)
+        for row, line in enumerate(prompt_lines[first:first + input_lines]):
+            prefix = "› " if first + row == 0 else "  "
+            self.screen.addstr(body + 2 + row, 0, clip(prefix + line, width - 1))
+
+        hint = " Enter enviar · Ctrl+J salto · Ctrl+O sesiones · Ctrl+G nueva · Ctrl+C salir "
+        footer = self.status or (f" {self.headline}" if self.headline else hint)
+        self.screen.addstr(height - 1, 0, clip(footer, width - 1), curses.A_DIM)
+
+        # El cursor, donde esté escribiendo.
+        col = display_width(cursor_lines[-1]) + 2
+        try:
+            self.screen.move(min(body + 2 + cursor_row - first, height - 2),
+                             min(col, width - 1))
+        except curses.error:
+            pass
+        self.screen.noutrefresh()
+        curses.doupdate()
+
+    # ------------------------------------------------------------------ teclado
+
+    def read_keys(self) -> bool:
+        """Atiende todas las teclas pendientes, no solo una.
+
+        La primera espera un poco (si no, el bucle daría vueltas en vacío
+        quemando CPU); las demás se cogen sin esperar nada, que es lo que hace
+        que escribir rápido se vea escribiendo rápido.
+        """
+        for _ in range(KEYS_PER_FRAME):
+            try:
+                key = self.screen.get_wch()
+            except curses.error:
+                break            # no quedan teclas pendientes
+            except KeyboardInterrupt:
+                return False
+            if not self.handle_key(key):
+                return False
+            self.screen.timeout(0)
+        self.screen.timeout(KEY_WAIT_MS)
+        return True
+
+    def handle_key(self, key) -> bool:
+        """Devuelve False para salir."""
+        _, _, body = self.layout()
+        if key == curses.KEY_RESIZE:
+            return True
+        if isinstance(key, int):
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                self.backspace()
+            elif key == curses.KEY_LEFT:
+                self.cursor = max(0, self.cursor - 1)
+            elif key == curses.KEY_RIGHT:
+                self.cursor = min(len(self.buffer), self.cursor + 1)
+            elif key == curses.KEY_HOME:
+                self.cursor = 0
+            elif key == curses.KEY_END:
+                self.cursor = len(self.buffer)
+            elif key == curses.KEY_PPAGE:
+                self.scroll += body - 1
+            elif key == curses.KEY_NPAGE:
+                self.scroll = max(0, self.scroll - (body - 1))
+            elif key in (curses.KEY_ENTER,):
+                self.submit()
+            return True
+
+        if key == "\r":
+            self.submit()
+        elif key == "\n":                      # Ctrl+J: salto de línea
+            self.insert("\n")
+        elif key in ("\x7f", "\b"):
+            self.backspace()
+        elif key == "\x03":                    # Ctrl+C
+            return False
+        elif key == "\x0c":                    # Ctrl+L
+            self.screen.clearok(True)
+        elif key == "\x0f":                    # Ctrl+O
+            self.pick_session()
+        elif key == "\x07":                    # Ctrl+G
+            self.new_session()
+        elif key == "\x12":                    # Ctrl+R
+            self.reload_history()
+        elif key == "\x15":                    # Ctrl+U
+            self.buffer = self.buffer[self.cursor:]
+            self.cursor = 0
+        elif key == "\x0b":                    # Ctrl+K
+            self.buffer = self.buffer[:self.cursor]
+        elif key == "\x17":                    # Ctrl+W
+            head = self.buffer[:self.cursor].rstrip()
+            cut = max(head.rfind(" "), head.rfind("\n")) + 1
+            self.buffer = self.buffer[:cut] + self.buffer[self.cursor:]
+            self.cursor = cut
+        elif key == "\x01":                    # Ctrl+A
+            self.cursor = 0
+        elif key == "\x05":                    # Ctrl+E
+            self.cursor = len(self.buffer)
+        elif key.isprintable() or key == "\t":
+            self.insert(key)
+        return True
+
+    def insert(self, text: str) -> None:
+        self.buffer = self.buffer[:self.cursor] + text + self.buffer[self.cursor:]
+        self.cursor += len(text)
+        self.scroll = 0
+
+    def backspace(self) -> None:
+        if self.cursor:
+            self.buffer = self.buffer[:self.cursor - 1] + self.buffer[self.cursor:]
+            self.cursor -= 1
+
+    # ------------------------------------------------------------------ sesiones
+
+    def switch_to(self, session: dict) -> None:
+        if _same_session(str(session.get("key") or ""), self.chat.session_key):
+            return
+        self.chat.unsubscribe()
+        self.chat.adopt(session)
+        self.clear_live()
+        self.transcript.clear()
+        self.scroll = 0
+        self.working = False
+        self.reload_history()
+
+    def new_session(self) -> None:
+        try:
+            key = self.chat.create_session()
+        except gw.GatewayError as error:
+            self.status = f"no se pudo crear la sesión: {error}"
+            return
+        except (WebSocketError, OSError) as error:
+            self.drop_connection(str(error))
+            return
+        if key:
+            self.switch_to({"key": key, "agentId": self.chat.agent_id})
+        else:
+            self.status = "el gateway no devolvió la sesión nueva"
+
+    def pick_session(self) -> None:
+        """Selector modal. Se dibuja encima; al salir se redibuja el panel."""
+        try:
+            self.sessions = self.chat.sessions()
+        except gw.GatewayError as error:
+            self.status = f"no se pudieron listar las sesiones: {error}"
+            return
+        except (WebSocketError, OSError) as error:
+            self.drop_connection(str(error))
+            return
+        if not self.sessions:
+            self.status = "no hay sesiones que listar"
+            return
+
+        labels = []
+        for session in self.sessions:
+            key = str(session.get("key") or "?")
+            title = str(session.get("displayName") or session.get("title")
+                        or session.get("derivedTitle") or "")
+            mark = "•" if session.get("isMain") else " "
+            labels.append((session, f"{mark} {key}  {title}".rstrip()))
+        selected = next((i for i, (session, _) in enumerate(labels)
+                         if _same_session(str(session.get("key") or ""),
+                                          self.chat.session_key)), 0)
+
+        while True:
+            height, width, _ = self.layout()
+            box_height = min(len(labels) + 2, max(5, height - 4))
+            box_width = min(max(len(text) for _, text in labels) + 4, width - 4)
+            top = max(1, (height - box_height) // 2)
+            left = max(0, (width - box_width) // 2)
+            window = curses.newwin(box_height, box_width, top, left)
+            window.erase()
+            window.box()
+            window.addstr(0, 2, clip(" sesiones ", box_width - 4), curses.A_BOLD)
+            view = max(0, selected - (box_height - 3))
+            for row, (_, text) in enumerate(labels[view:view + box_height - 2]):
+                attr = curses.A_REVERSE if view + row == selected else 0
+                window.addstr(1 + row, 1, clip(text.ljust(box_width - 2), box_width - 2), attr)
+            window.refresh()
+
+            try:
+                key = window.get_wch()
+            except curses.error:
+                continue
+            except KeyboardInterrupt:
+                break
+            if key in (curses.KEY_UP, "k"):
+                selected = max(0, selected - 1)
+            elif key in (curses.KEY_DOWN, "j"):
+                selected = min(len(labels) - 1, selected + 1)
+            elif key in ("\r", "\n", curses.KEY_ENTER):
+                self.switch_to(labels[selected][0])
+                break
+            elif key in ("\x1b", "q", "\x0f"):
+                break
+            elif key == "n":
+                self.new_session()
+                break
+        self.screen.clearok(True)
+
+
+# --------------------------------------------------------------------------- #
+# Modos de línea de comandos
+# --------------------------------------------------------------------------- #
+
+def build_gateway(config: dict) -> gw.Gateway:
+    return gw.Gateway(config["CLAW_URL"], config.get("CLAW_TOKEN"), version=VERSION)
+
+
+def explain_pairing(gateway: gw.Gateway) -> str:
+    origin = gw.http_origin(gateway.base_url)
+    return (f"Este dispositivo ({gateway.identity.device_id}) está pendiente de "
+            f"aprobación.\nApruébalo en {origin}/settings/devices y vuelve a abrir "
+            f"el panel.")
+
+
+def cmd_check(config: dict) -> int:
+    source = config.get("_source") or "(ninguno: valores por defecto y entorno)"
+    print(f"configuración : {source}")
+    print(f"gateway       : {config['CLAW_URL']}  ->  {gw.ws_url(config['CLAW_URL'])}")
+    print(f"token         : {'sí' if config.get('CLAW_TOKEN') else 'NO (falta CLAW_TOKEN)'}")
+    print(f"sesión        : {config['CLAW_SESSION']}")
+    gateway = build_gateway(config)
+    print(f"dispositivo   : {gateway.identity.device_id}")
+    try:
+        hello = gateway.connect()
+    except gw.PairingRequired:
+        print("\n" + explain_pairing(gateway))
+        return 2
+    except gw.GatewayError as error:
+        print(f"\nel gateway rechazó la conexión [{error.detail_code}]: {error}")
+        return 1
+    except (WebSocketError, OSError) as error:
+        print(f"\nno se pudo conectar: {error}")
+        return 1
+
+    auth = hello.get("auth") or {}
+    print(f"handshake     : ok (protocolo {hello.get('protocol') or '?'})")
+    print(f"rol y permisos: {auth.get('role') or '?'} {auth.get('scopes') or []}")
+    chat = Chat(gateway, config["CLAW_SESSION"])
+    try:
+        sessions = chat.sessions()
+        print(f"sesiones      : {len(sessions)}")
+        for session in sessions[:10]:
+            mark = "*" if session.get("isMain") else "-"
+            name = session.get("displayName") or session.get("title") or ""
+            print(f"  {mark} {session.get('key')}  {name}".rstrip())
+    except gw.GatewayError as error:
+        print(f"sesiones      : no se pudieron listar [{error.detail_code}]: {error}")
+    resolved = chat.resolve()
+    print(f"sesión abierta: {chat.session_key}"
+          f"{'  (agente ' + chat.agent_id + ')' if chat.agent_id else ''}"
+          f"{'' if resolved else '  ← no resuelta'}")
+    try:
+        entries = chat.history(limit=5)
+        print(f"historial     : {len(entries)} mensajes en {chat.session_key}")
+        for entry in entries[-3:]:
+            flat = " ".join(entry.text.split())
+            print(f"  {ROLE_LABELS.get(entry.role, entry.role)}: {flat[:70]}")
+    except gw.GatewayError as error:
+        print(f"historial     : no se pudo leer [{error.detail_code}]: {error}")
+    gateway.close()
+    return 0
+
+
+def cmd_pair(config: dict) -> int:
+    gateway = build_gateway(config)
+    print(f"dispositivo: {gateway.identity.device_id}")
+    try:
+        gateway.connect()
+    except gw.PairingRequired:
+        print(explain_pairing(gateway))
+        return 2
+    except (gw.GatewayError, WebSocketError, OSError) as error:
+        print(f"no se pudo conectar: {error}")
+        return 1
+    print("ya estaba emparejado: el gateway acepta este dispositivo.")
+    gateway.close()
+    return 0
+
+
+def cmd_raw(config: dict) -> int:
+    """Vuelca eventos tal y como llegan. Es la herramienta para ver qué manda
+    OpenClaw cuando el panel pinta algo raro."""
+    gateway = build_gateway(config)
+    try:
+        gateway.connect()
+    except gw.PairingRequired:
+        print(explain_pairing(gateway))
+        return 2
+    except (gw.GatewayError, WebSocketError, OSError) as error:
+        print(f"no se pudo conectar: {error}")
+        return 1
+    chat = Chat(gateway, config["CLAW_SESSION"])
+    chat.resolve()
+    chat.subscribe()
+    print(f"escuchando {chat.session_key} (Ctrl+C para salir)")
+    try:
+        while True:
+            events = gateway.pump()
+            for event in events:
+                print(json.dumps(event, ensure_ascii=False)[:4000], flush=True)
+            if not events:
+                time.sleep(0.2)
+    except KeyboardInterrupt:
+        return 0
+    except WebSocketClosed as error:
+        print(f"cerrado: {error}")
+        return 1
+    finally:
+        gateway.close()
+
+
+def cmd_tui(config: dict) -> int:
+    gateway = build_gateway(config)
+    try:
+        gateway.connect()
+    except gw.PairingRequired:
+        # Sin pantalla todavía: el mensaje sale en el panel tal cual, que es
+        # donde el usuario lo va a leer.
+        print(explain_pairing(gateway), file=sys.stderr)
+        return 2
+    except gw.GatewayError as error:
+        print(f"claw: el gateway rechazó la conexión [{error.detail_code}]: {error}",
+              file=sys.stderr)
+        if error.detail_code.startswith("AUTH"):
+            print("Revisa CLAW_TOKEN en "
+                  f"{(config.get('_source') or 'el .env del plugin')}.", file=sys.stderr)
+        return 1
+    except (WebSocketError, OSError) as error:
+        print(f"claw: no se pudo conectar a {config['CLAW_URL']}: {error}", file=sys.stderr)
+        return 1
+
+    chat = Chat(gateway, config["CLAW_SESSION"])
+    if chat.resolve() is None:
+        print(f"claw: el gateway no tiene ninguna sesión que case con "
+              f"'{config['CLAW_SESSION']}'.", file=sys.stderr)
+        gateway.close()
+        return 1
+    panel: dict[str, App] = {}
+
+    def start(screen) -> None:
+        panel["app"] = App(screen, chat, config)
+        panel["app"].run()
+
+    try:
+        curses.wrapper(start)
+    finally:
+        # Sin soltarlo, herdr seguiría enseñando el panel como un agente vivo
+        # después de cerrarlo.
+        if "app" in panel:
+            panel["app"].agent.release()
+        gateway.close()
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="claw", description="Cliente TUI de OpenClaw para un panel de herdr")
+    parser.add_argument("--session", help="clave de la sesión a abrir")
+    parser.add_argument("--url", help="URL del gateway (si no, CLAW_URL)")
+    parser.add_argument("--check", action="store_true",
+                        help="diagnóstico de configuración y conexión")
+    parser.add_argument("--pair", action="store_true",
+                        help="enseña el id del dispositivo y deja la solicitud puesta")
+    parser.add_argument("--raw", action="store_true",
+                        help="vuelca los eventos del gateway (depuración)")
+    args = parser.parse_args(argv)
+
+    config = load_config()
+    if args.url:
+        config["CLAW_URL"] = args.url
+    if args.session:
+        config["CLAW_SESSION"] = args.session
+    if not config.get("CLAW_TOKEN") and not (args.check or args.pair):
+        print("claw: falta CLAW_TOKEN. Copia config.example.env a "
+              f"{config_dirs()[0] if config_dirs() else '~/.config/herdr/plugins/config/claw'}"
+              "/.env y pon el token del gateway.", file=sys.stderr)
+        return 1
+
+    if args.check:
+        return cmd_check(config)
+    if args.pair:
+        return cmd_pair(config)
+    if args.raw:
+        return cmd_raw(config)
+    return cmd_tui(config)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

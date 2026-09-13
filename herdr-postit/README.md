@@ -178,6 +178,11 @@ el tablero va en `prefix+o` (de nOtas) y `prefix+O` en pestaña, igual que
 El tablero se abre **en el directorio del panel que tuvieras enfocado**, así que
 `p` (ver solo lo de este proyecto) ya arranca apuntando donde estabas.
 
+`prefix+O` no abre una pestaña nueva si ya hay una: si el tablero sigue dentro
+salta a ella, y si la pestaña sobrevivió al cierre de herdr con el tablero ya
+muerto (la distribución se guarda en `session.json`, el programa de dentro no
+vuelve solo) lo relanza en ese mismo panel. Solo crea pestaña cuando no existe.
+
 La pestaña de `prefix+O` se renombra a `herdr-postit` (`POSTIT_TAB_NAME` lo
 cambia). Nacería llamándose `python3`, por el programa que corre dentro, y el
 plugin de renombrado automático llega a bautizarla justo después que nosotros:

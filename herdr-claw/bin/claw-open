@@ -1,0 +1,57 @@
+#!/bin/sh
+# Abre el chat de OpenClaw en un panel de herdr. `split` y `popup` son directos;
+# `tab` reaprovecha la pestaña si ya existe, que si no el workspace se llena de
+# pestañas «claw» vacías cada vez que se pulsa la tecla.
+set -eu
+
+HERDR="${HERDR_BIN_PATH:-herdr}"
+mode="${1:-split}"
+TAB_NAME="${CLAW_TAB_NAME:-claw}"
+
+# Las pestañas se listan por workspace; si el contexto no lo trae, que herdr
+# resuelva el que tenga enfocado.
+WS=""
+[ -n "${HERDR_WORKSPACE_ID:-}" ] && WS="--workspace $HERDR_WORKSPACE_ID"
+
+# La pestaña del chat, si ya existe. Se busca por nombre porque el id cambia en
+# cada sesión de herdr, y el renombrado automático le pone delante un [N].
+find_tab() {
+  "$HERDR" tab list $WS 2>/dev/null | CLAW_TAB_NAME="$TAB_NAME" python3 -c '
+import json, os, sys
+want = os.environ["CLAW_TAB_NAME"]
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+for tab in (data.get("result") or data).get("tabs") or []:
+    if (tab.get("label") or "").endswith(want):
+        print(tab.get("tab_id") or "")
+        break
+' 2>/dev/null || true
+}
+
+case "$mode" in
+  popup)
+    exec "$HERDR" plugin pane open --plugin claw --entrypoint popup
+    ;;
+  tab)
+    tab="$(find_tab)"
+    if [ -n "$tab" ]; then
+      exec "$HERDR" tab focus "$tab"
+    fi
+    out="$("$HERDR" plugin pane open --plugin claw --entrypoint chat --placement tab)"
+    tab="$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+pane = ((data.get("result") or {}).get("plugin_pane") or {}).get("pane") or {}
+print(pane.get("tab_id") or "")
+' 2>/dev/null)" || tab=""
+    [ -n "$tab" ] && "$HERDR" tab rename "$tab" "$TAB_NAME" >/dev/null 2>&1 || true
+    ;;
+  *)
+    exec "$HERDR" plugin pane open --plugin claw --entrypoint chat --placement split --direction right
+    ;;
+esac
